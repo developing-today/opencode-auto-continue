@@ -303,11 +303,21 @@ const plugin = async ({ client, directory }) => {
             const reloaded = await loadConfig(directory, log);
             Object.assign(globalConfig, reloaded);
             if (fileExists) {
-                await sendMessage(sessionID, `Global config reloaded from ${CONFIG_FILE}.\n${JSON.stringify(globalConfig, null, 2)}`);
+                await sendMessage(sessionID, `Global config reloaded from ${CONFIG_FILE}.`);
             }
             else {
-                await sendMessage(sessionID, `No ${CONFIG_FILE} found — using defaults.\n${JSON.stringify(globalConfig, null, 2)}`);
+                await sendMessage(sessionID, `No ${CONFIG_FILE} found — using defaults.`);
             }
+            // Dismiss the overlay by sending blank messages after a delay
+            setTimeout(async () => {
+                try {
+                    await sendMessage(sessionID, "\u200B");
+                    await sendMessage(sessionID, "\u200B");
+                }
+                catch {
+                    // Best effort
+                }
+            }, 2000);
             throw new Error("__AUTO_CONTINUE_HANDLED__");
         }
         // ── Reset (clear session overrides) ──
