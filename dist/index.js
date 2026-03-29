@@ -40,6 +40,8 @@ const DEFAULTS = {
     maxConsecutive: 5,
     /** Whether the plugin is enabled */
     enabled: true,
+    /** Minimum ms between remote version checks */
+    checkIntervalMs: 30_000,
 };
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function parseJsonc(text) {
@@ -101,6 +103,8 @@ async function loadConfig(directory, log) {
             config.maxConsecutive = parsed.maxConsecutive;
         if (typeof parsed.enabled === "boolean")
             config.enabled = parsed.enabled;
+        if (typeof parsed.checkIntervalMs === "number")
+            config.checkIntervalMs = parsed.checkIntervalMs;
         log(`Loaded config from ${configPath}: ${JSON.stringify(config)}`);
         return config;
     }
@@ -154,16 +158,76 @@ const plugin = async ({ client, directory }) => {
     // Snapshot content hash at load time
     const loadedHash = await readBunLockHash();
     log(`Loaded with content hash: ${loadedHash ?? "unknown"}`);
+    // Cached remote version check (debounced)
+    let lastRemoteCheck = 0;
+    let cachedRemoteHash = null;
+    let cachedCommitSha = null;
+    async function fetchLatestHash() {
+        const cfg = globalConfig;
+        const now = Date.now();
+        if (now - lastRemoteCheck < cfg.checkIntervalMs) {
+            return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
+        }
+        try {
+            const response = await fetch(GITHUB_API_RELEASE, {
+                headers: { "User-Agent": PLUGIN_NAME },
+            });
+            if (!response.ok)
+                return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
+            const release = (await response.json());
+            const body = release.body || "";
+            const bodyLines = body.split("\n");
+            cachedRemoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
+            const commitLine = bodyLines.find((l) => l.startsWith("Commit: "));
+            cachedCommitSha = commitLine?.replace("Commit: ", "").trim() ?? null;
+            lastRemoteCheck = now;
+        }
+        catch {
+            // Network failure — keep stale cache
+        }
+        return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
+    }
     // Version info for display
-    async function versionInfo() {
+    async function versionInfo(checkRemote = false) {
         const loadedShort = loadedHash ? shortHash(loadedHash) : "unknown";
         const currentHash = await readBunLockHash();
         const currentShort = currentHash ? shortHash(currentHash) : "unknown";
-        if (!loadedHash || !currentHash || loadedHash === currentHash) {
-            return loadedShort;
+        const lines = [];
+        // Base version
+        lines.push(loadedShort);
+        // Local: loaded vs current bun.lock
+        const localUpdated = loadedHash && currentHash && loadedHash !== currentHash;
+        if (localUpdated) {
+            lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
         }
-        // Hashes differ — update installed but not loaded
-        return `${loadedShort}\n  ⚠️  *needs opencode reload* (bun: ${currentShort})`;
+        // Remote check (only when requested — status, help with /ac)
+        if (checkRemote) {
+            const { hash: remoteHash, commitSha } = await fetchLatestHash();
+            const remoteShort = remoteHash ? shortHash(remoteHash) : null;
+            const shortSha = commitSha?.substring(0, 7) ?? "";
+            if (remoteHash && remoteShort) {
+                const matchesLoaded = loadedHash === remoteHash;
+                const matchesCurrent = currentHash === remoteHash;
+                if (matchesLoaded && matchesCurrent) {
+                    // All same — nothing to add
+                }
+                else if (!localUpdated && !matchesLoaded) {
+                    // loaded == current, remote is different → update available
+                    lines.push(`  🆕 Update available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+                    lines.push(`     Run /ac global update then /ac reload`);
+                }
+                else if (localUpdated && matchesCurrent) {
+                    // Already updated locally, matches remote — just needs reload (already shown above)
+                }
+                else if (localUpdated && !matchesCurrent && !matchesLoaded) {
+                    // All three differ: loaded ≠ current ≠ remote
+                    lines.push(`  🆕 Newer version available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+                    lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
+                    lines.push(`     Run /ac global update then restart opencode`);
+                }
+            }
+        }
+        return lines.join("\n");
     }
     // Merge global config with per-session overrides
     function getEffectiveConfig(sessionID) {
@@ -247,17 +311,19 @@ const plugin = async ({ client, directory }) => {
             parts.push(`delay: ${overrides.delayMs}ms`);
         if (overrides.maxConsecutive !== undefined)
             parts.push(`max: ${overrides.maxConsecutive}`);
+        if (overrides.checkIntervalMs !== undefined)
+            parts.push(`check-interval: ${overrides.checkIntervalMs}ms`);
         return [
             "",
             `  Session overrides: ${parts.join(" · ")}`,
-            `  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive}`,
+            `  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive} · check-interval: ${globalConfig.checkIntervalMs}ms`,
         ];
     }
-    async function configSummaryLines(sessionID) {
+    async function configSummaryLines(sessionID, checkRemote = false) {
         const cfg = getEffectiveConfig(sessionID);
         const overrides = sessionConfigs.get(sessionID);
         const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
-        const ver = await versionInfo();
+        const ver = await versionInfo(checkRemote);
         const lines = [
             `  Status: ${status} · ${ver}`,
             `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
@@ -273,38 +339,41 @@ const plugin = async ({ client, directory }) => {
             "│       Auto-Continue Commands             │",
             "╰──────────────────────────────────────────╯",
             "",
-            ...(await configSummaryLines(sessionID)),
+            ...(await configSummaryLines(sessionID, true)),
         ];
-        lines.push("", "  /auto-continue on|off          Enable/disable (session)", "  /auto-continue cooldown <ms>   Set cooldown (session)", "  /auto-continue delay <ms>      Set delay (session)", "  /auto-continue max <n>         Set max retries (session)", "  /auto-continue status          Show current settings", "  /auto-continue reset           Clear session overrides", "  /auto-continue reload           Reload global config from disk", "  /auto-continue global <cmd>    Persist setting to config file", "  /auto-continue global update   Clear cache to fetch latest version", "  /auto-continue help            Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
+        lines.push("", "  /auto-continue on|off              Enable/disable (session)", "  /auto-continue cooldown <ms>       Set cooldown (session)", "  /auto-continue delay <ms>          Set delay (session)", "  /auto-continue max <n>             Set max retries (session)", "  /auto-continue check-interval <ms> Set version check interval (session)", "  /auto-continue status              Show current settings", "  /auto-continue reset               Clear session overrides", "  /auto-continue reload              Reload global config from disk", "  /auto-continue global <cmd>        Persist setting to config file", "  /auto-continue global update       Clear cache to fetch latest version", "  /auto-continue help                Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
         return lines.join("\n");
     }
     async function statusText(sessionID) {
         const cfg = getEffectiveConfig(sessionID);
         const overrides = sessionConfigs.get(sessionID);
         const state = sessions.get(sessionID);
-        const ver = await versionInfo();
+        const ver = await versionInfo(true);
         const lines = [
             "╭──────────────────────────────────────────╮",
             "│       Auto-Continue Status               │",
             "╰──────────────────────────────────────────╯",
             "",
-            `  Version:      ${ver}`,
-            `  Enabled:      ${cfg.enabled ? "✅ yes" : "❌ no"}`,
-            `  Cooldown:     ${cfg.cooldownMs}ms`,
-            `  Delay:        ${cfg.delayMs}ms`,
-            `  Max Retries:  ${cfg.maxConsecutive}`,
+            `  Version:        ${ver}`,
+            `  Enabled:        ${cfg.enabled ? "✅ yes" : "❌ no"}`,
+            `  Cooldown:       ${cfg.cooldownMs}ms`,
+            `  Delay:          ${cfg.delayMs}ms`,
+            `  Max Retries:    ${cfg.maxConsecutive}`,
+            `  Check Interval: ${cfg.checkIntervalMs}ms`,
         ];
         if (overrides && Object.keys(overrides).length > 0) {
             lines.push("");
             lines.push("  ── Session Overrides ──");
             if (overrides.enabled !== undefined)
-                lines.push(`  Enabled:      ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`);
+                lines.push(`  Enabled:        ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`);
             if (overrides.cooldownMs !== undefined)
-                lines.push(`  Cooldown:     ${overrides.cooldownMs}ms  (global: ${globalConfig.cooldownMs}ms)`);
+                lines.push(`  Cooldown:       ${overrides.cooldownMs}ms  (global: ${globalConfig.cooldownMs}ms)`);
             if (overrides.delayMs !== undefined)
-                lines.push(`  Delay:        ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
+                lines.push(`  Delay:          ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
             if (overrides.maxConsecutive !== undefined)
-                lines.push(`  Max Retries:  ${overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive})`);
+                lines.push(`  Max Retries:    ${overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive})`);
+            if (overrides.checkIntervalMs !== undefined)
+                lines.push(`  Check Interval: ${overrides.checkIntervalMs}ms  (global: ${globalConfig.checkIntervalMs}ms)`);
         }
         lines.push("", "  ── Session State ──", `  Consecutive retries: ${state?.consecutiveCount ?? 0}`, `  Pending continue:    ${state?.pendingContinue ? "yes" : "no"}`, "", "  ── Global Config ──", `  ${JSON.stringify(globalConfig)}`);
         return lines.join("\n");
@@ -329,8 +398,8 @@ const plugin = async ({ client, directory }) => {
             await sendMessage(sessionID, `Auto-continue ${enabled ? "✅ enabled" : "❌ disabled"} for this session.`);
             throw new Error("__AUTO_CONTINUE_HANDLED__");
         }
-        // ── Cooldown / Delay / Max ──
-        if (subcmd === "cooldown" || subcmd === "delay" || subcmd === "max") {
+        // ── Cooldown / Delay / Max / Check-Interval ──
+        if (subcmd === "cooldown" || subcmd === "delay" || subcmd === "max" || subcmd === "check-interval") {
             const value = parseInt(args[1], 10);
             if (isNaN(value) || value < 0) {
                 await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue ${subcmd} <number>`);
@@ -341,10 +410,17 @@ const plugin = async ({ client, directory }) => {
                 cooldown: "cooldownMs",
                 delay: "delayMs",
                 max: "maxConsecutive",
+                "check-interval": "checkIntervalMs",
             };
             overrides[keyMap[subcmd]] = value;
             sessionConfigs.set(sessionID, overrides);
-            const label = subcmd === "cooldown" ? "Cooldown" : subcmd === "delay" ? "Delay" : "Max consecutive";
+            const label = subcmd === "cooldown"
+                ? "Cooldown"
+                : subcmd === "delay"
+                    ? "Delay"
+                    : subcmd === "max"
+                        ? "Max consecutive"
+                        : "Check interval";
             const unit = subcmd === "max" ? "" : "ms";
             await sendMessage(sessionID, `${label} set to ${value}${unit} for this session.`);
             throw new Error("__AUTO_CONTINUE_HANDLED__");
@@ -484,7 +560,7 @@ const plugin = async ({ client, directory }) => {
                 await sendMessage(sessionID, `Global config: auto-continue ${globalSub === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`);
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
             }
-            if (globalSub === "cooldown" || globalSub === "delay" || globalSub === "max") {
+            if (globalSub === "cooldown" || globalSub === "delay" || globalSub === "max" || globalSub === "check-interval") {
                 const value = parseInt(args[2], 10);
                 if (isNaN(value) || value < 0) {
                     await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue global ${globalSub} <number>`);
@@ -494,10 +570,17 @@ const plugin = async ({ client, directory }) => {
                     cooldown: "cooldownMs",
                     delay: "delayMs",
                     max: "maxConsecutive",
+                    "check-interval": "checkIntervalMs",
                 };
                 globalConfig[keyMap[globalSub]] = value;
                 await writeGlobalConfig();
-                const label = globalSub === "cooldown" ? "Cooldown" : globalSub === "delay" ? "Delay" : "Max consecutive";
+                const label = globalSub === "cooldown"
+                    ? "Cooldown"
+                    : globalSub === "delay"
+                        ? "Delay"
+                        : globalSub === "max"
+                            ? "Max consecutive"
+                            : "Check interval";
                 const unit = globalSub === "max" ? "" : "ms";
                 await sendMessage(sessionID, `Global config: ${label} set to ${value}${unit}. Written to ${CONFIG_FILE}.`);
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
@@ -506,11 +589,12 @@ const plugin = async ({ client, directory }) => {
             const text = [
                 "Usage: /auto-continue global <subcommand>",
                 "",
-                "  on|off          Enable/disable globally",
-                "  cooldown <ms>   Set global cooldown",
-                "  delay <ms>      Set global delay",
-                "  max <n>         Set global max retries",
-                "  update          Clear cache to fetch latest version",
+                "  on|off              Enable/disable globally",
+                "  cooldown <ms>       Set global cooldown",
+                "  delay <ms>          Set global delay",
+                "  max <n>             Set global max retries",
+                "  check-interval <ms> Set global version check interval",
+                "  update              Clear cache to fetch latest version",
             ].join("\n");
             await sendMessage(sessionID, text);
             throw new Error("__AUTO_CONTINUE_HANDLED__");
