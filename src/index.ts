@@ -42,7 +42,7 @@ const DEFAULTS = {
   throttleMs: 5_000,
   /** Delay after session.idle before sending continue */
   delayMs: 2_000,
-  /** Max consecutive auto-continues per session before giving up */
+  /** Max consecutive auto-continues per session before giving up (0 = unlimited) */
   maxConsecutive: 5,
   /** Whether the plugin is enabled */
   enabled: true,
@@ -333,7 +333,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       return;
     }
 
-    if (state.consecutiveCount >= config.maxConsecutive) {
+    if (config.maxConsecutive > 0 && state.consecutiveCount >= config.maxConsecutive) {
       log(`Max consecutive (${config.maxConsecutive}) reached for ${sessionID}, giving up`);
       state.pendingContinue = false;
       return;
@@ -343,7 +343,8 @@ const plugin: Plugin = async ({ client, directory }) => {
     state.consecutiveCount++;
     state.pendingContinue = false;
 
-    log(`Sending "continue" to ${sessionID} (attempt ${state.consecutiveCount}/${config.maxConsecutive})`);
+    const maxLabel = config.maxConsecutive > 0 ? `${config.maxConsecutive}` : "∞";
+    log(`Sending "continue" to ${sessionID} (attempt ${state.consecutiveCount}/${maxLabel})`);
 
     try {
       await client.session.promptAsync({
@@ -365,13 +366,13 @@ const plugin: Plugin = async ({ client, directory }) => {
     if (overrides.enabled !== undefined) parts.push(`enabled: ${overrides.enabled}`);
     if (overrides.throttleMs !== undefined) parts.push(`throttle: ${overrides.throttleMs}ms`);
     if (overrides.delayMs !== undefined) parts.push(`delay: ${overrides.delayMs}ms`);
-    if (overrides.maxConsecutive !== undefined) parts.push(`max: ${overrides.maxConsecutive}`);
+    if (overrides.maxConsecutive !== undefined) parts.push(`max: ${overrides.maxConsecutive === 0 ? "unlimited" : overrides.maxConsecutive}`);
     if (overrides.updateThrottleMs !== undefined) parts.push(`update-throttle: ${overrides.updateThrottleMs}ms`);
     const globalParts = [
       `enabled: ${globalConfig.enabled}`,
       `throttle: ${globalConfig.throttleMs}ms`,
       `delay: ${globalConfig.delayMs}ms`,
-      `max: ${globalConfig.maxConsecutive}`,
+      `max: ${globalConfig.maxConsecutive === 0 ? "unlimited" : globalConfig.maxConsecutive}`,
     ];
     if (globalConfig.updateThrottleMs !== DEFAULTS.updateThrottleMs) {
       globalParts.push(`update-throttle: ${globalConfig.updateThrottleMs}ms`);
@@ -384,7 +385,8 @@ const plugin: Plugin = async ({ client, directory }) => {
     const overrides = sessionConfigs.get(sessionID);
     const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
     const ver = await versionInfo(checkRemote);
-    const summaryParts = [`Throttle: ${cfg.throttleMs}ms`, `Delay: ${cfg.delayMs}ms`, `Max: ${cfg.maxConsecutive}`];
+    const maxDisplay = cfg.maxConsecutive === 0 ? "unlimited" : String(cfg.maxConsecutive);
+    const summaryParts = [`Throttle: ${cfg.throttleMs}ms`, `Delay: ${cfg.delayMs}ms`, `Max: ${maxDisplay}`];
     if (cfg.updateThrottleMs !== DEFAULTS.updateThrottleMs) {
       summaryParts.push(`Update: ${cfg.updateThrottleMs}ms`);
     }
@@ -409,7 +411,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       "  /auto-continue on|off              Enable/disable (session)",
       "  /auto-continue throttle <ms>         Set retry throttle (session)",
       "  /auto-continue delay <ms>          Set delay (session)",
-      "  /auto-continue max <n>             Set max retries (session)",
+      "  /auto-continue max <n>             Set max retries (session, 0=unlimited)",
       "  /auto-continue update-throttle <ms>  Set update throttle (session)",
       "  /auto-continue status              Show current settings",
       "  /auto-continue reset               Clear session overrides",
@@ -437,7 +439,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       `  Enabled:        ${cfg.enabled ? "✅ yes" : "❌ no"}`,
       `  Throttle:        ${cfg.throttleMs}ms`,
       `  Delay:          ${cfg.delayMs}ms`,
-      `  Max Retries:    ${cfg.maxConsecutive}`,
+      `  Max Retries:    ${cfg.maxConsecutive === 0 ? "unlimited (0)" : cfg.maxConsecutive}`,
       `  Update throttle: ${cfg.updateThrottleMs}ms`,
     ];
 
@@ -453,7 +455,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       if (overrides.delayMs !== undefined)
         lines.push(`  Delay:          ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
       if (overrides.maxConsecutive !== undefined)
-        lines.push(`  Max Retries:    ${overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive})`);
+        lines.push(`  Max Retries:    ${overrides.maxConsecutive === 0 ? "unlimited (0)" : overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive === 0 ? "unlimited (0)" : globalConfig.maxConsecutive})`);
       if (overrides.updateThrottleMs !== undefined)
         lines.push(`  Update throttle: ${overrides.updateThrottleMs}ms  (global: ${globalConfig.updateThrottleMs}ms)`);
     }
@@ -745,7 +747,7 @@ const plugin: Plugin = async ({ client, directory }) => {
         "  on|off              Enable/disable globally",
         "  throttle <ms>       Set global retry throttle",
         "  delay <ms>          Set global delay",
-        "  max <n>             Set global max retries",
+        "  max <n>             Set global max retries (0=unlimited)",
         "  update-throttle <ms> Set global update throttle",
         "  update              Clear cache to fetch latest version",
       ].join("\n");

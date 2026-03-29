@@ -77,7 +77,7 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
   // Delay after session becomes idle before sending continue
   "delayMs": 2000,
 
-  // Max consecutive auto-continues per session before giving up
+  // Max consecutive auto-continues per session before giving up (0 = unlimited)
   "maxConsecutive": 5,
 
   // Set to false to disable the plugin without removing it
@@ -94,7 +94,7 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
 |---------|------|---------|-------------|
 | `throttleMs` | number | `5000` | Retry throttle: minimum ms between auto-continues per session |
 | `delayMs` | number | `2000` | Delay after session idle before sending continue |
-| `maxConsecutive` | number | `5` | Max consecutive auto-continues before giving up |
+| `maxConsecutive` | number | `5` | Max consecutive auto-continues before giving up (0 = unlimited) |
 | `enabled` | boolean | `true` | Set `false` to disable without removing from plugin list |
 | `updateThrottleMs` | number | `30000` | Update throttle: minimum ms between remote version checks. Version is only checked when you run `/ac`, `/ac status`, or `/auto-continue` — this limits how often that check hits GitHub. |
 
