@@ -1,4 +1,4 @@
-name: Update latest tag
+name: Build, tag and release
 
 on:
   push:
@@ -8,11 +8,58 @@ permissions:
   contents: write
 
 jobs:
-  tag:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Force-update latest tag
+
+      - name: Set variables
+        id: vars
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          UTC=$(date -u +%Y%m%dT%H%M%SZ)
+          DATED_TAG="${UTC}-${SHORT}"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "dated_tag=$DATED_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Compute content hash (same as bun uses)
+        id: hash
+        run: |
+          # Download the tarball GitHub generates for this commit and compute sha512
+          TARBALL_URL="https://github.com/${{ github.repository }}/archive/${GITHUB_SHA}.tar.gz"
+          HASH=$(curl -sL "$TARBALL_URL" | openssl dgst -sha512 -binary | openssl base64 -A)
+          SRI="sha512-${HASH}"
+          echo "content_hash=$SRI" >> "$GITHUB_OUTPUT"
+
+      - name: Push tags
         run: |
           git tag -f latest HEAD
-          git push origin latest --force
+          git tag "${{ steps.vars.outputs.dated_tag }}" HEAD
+          git push origin latest "${{ steps.vars.outputs.dated_tag }}" --force
+
+      - name: Create dated release (marked as latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.vars.outputs.dated_tag }}" \
+            --title "${{ steps.vars.outputs.dated_tag }}" \
+            --latest \
+            --notes "${{ steps.hash.outputs.content_hash }}
+          
+          Commit: ${{ steps.vars.outputs.sha }}
+          Repository: https://github.com/${{ github.repository }}"
+
+      - name: Create/update latest release (not marked as latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete existing latest release if present
+          gh release delete latest --yes 2>/dev/null || true
+          gh release create latest \
+            --title "latest" \
+            --notes "${{ steps.hash.outputs.content_hash }}
+          
+          Commit: ${{ steps.vars.outputs.sha }}
+          Points to same content as ${{ steps.vars.outputs.dated_tag }}"

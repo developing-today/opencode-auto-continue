@@ -4,6 +4,29 @@ const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_FILE = `${PLUGIN_NAME}.jsonc`;
 const GITHUB_REPO = "developing-today/opencode-auto-continue";
 const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/commits/main`;
+// ─── Content hash from bun.lock ─────────────────────────────────────────────
+let cachedContentHash = null;
+async function getContentHash() {
+    if (cachedContentHash !== null)
+        return cachedContentHash;
+    try {
+        const home = process.env.HOME || process.env.USERPROFILE || "";
+        const lockPath = join(home, ".cache", "opencode", "bun.lock");
+        const raw = await readFile(lockPath, "utf-8");
+        // Find the resolved entry line: "opencode-auto-continue": ["opencode-auto-continue@...", {...}, "sha512-..."]
+        const pattern = new RegExp(`"${PLUGIN_NAME}":\\s*\\[.*?,\\s*"(sha512-[^"]+)"`);
+        const match = raw.match(pattern);
+        if (match?.[1]) {
+            cachedContentHash = match[1];
+            return cachedContentHash;
+        }
+    }
+    catch {
+        // Not critical
+    }
+    cachedContentHash = "unknown";
+    return cachedContentHash;
+}
 /**
  * Default configuration values.
  */
@@ -198,15 +221,16 @@ const plugin = async ({ client, directory }) => {
         }
     }
     // ── Command UI helpers ──────────────────────────────────────────────────
-    function helpText(sessionID) {
+    async function helpText(sessionID) {
         const cfg = getEffectiveConfig(sessionID);
         const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
+        const hash = await getContentHash();
         return [
             "╭──────────────────────────────────────────╮",
             "│       Auto-Continue Commands             │",
             "╰──────────────────────────────────────────╯",
             "",
-            `  Status: ${status}`,
+            `  Status: ${status} · ${hash}`,
             `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
             "",
             "  /auto-continue on|off          Enable/disable (session)",
@@ -223,15 +247,17 @@ const plugin = async ({ client, directory }) => {
             "  Alias: /ac (same commands, e.g. /ac status)",
         ].join("\n");
     }
-    function statusText(sessionID) {
+    async function statusText(sessionID) {
         const cfg = getEffectiveConfig(sessionID);
         const overrides = sessionConfigs.get(sessionID);
         const state = sessions.get(sessionID);
+        const hash = await getContentHash();
         return [
             "╭──────────────────────────────────────────╮",
             "│       Auto-Continue Status               │",
             "╰──────────────────────────────────────────╯",
             "",
+            `  Version:      ${hash}`,
             `  Enabled:      ${cfg.enabled ? "✅ yes" : "❌ no"}`,
             `  Cooldown:     ${cfg.cooldownMs}ms`,
             `  Delay:        ${cfg.delayMs}ms`,
@@ -254,7 +280,7 @@ const plugin = async ({ client, directory }) => {
         const sessionID = input.sessionID;
         // ── Help (default) ──
         if (!subcmd || subcmd === "help") {
-            await sendMessage(sessionID, helpText(sessionID));
+            await sendMessage(sessionID, await helpText(sessionID));
             throw new Error("__AUTO_CONTINUE_HANDLED__");
         }
         // ── On / Off ──
@@ -288,7 +314,7 @@ const plugin = async ({ client, directory }) => {
         }
         // ── Status ──
         if (subcmd === "status") {
-            await sendMessage(sessionID, statusText(sessionID));
+            await sendMessage(sessionID, await statusText(sessionID));
             throw new Error("__AUTO_CONTINUE_HANDLED__");
         }
         // ── Reload (re-read global config from disk) ──
