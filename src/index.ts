@@ -184,6 +184,7 @@ const plugin: Plugin = async ({ client, directory }) => {
   let lastRemoteCheck = 0;
   let cachedRemoteHash: string | null = null;
   let cachedCommitSha: string | null = null;
+  let cacheAlreadyCleared = false;
 
   async function fetchLatestHash(): Promise<{ hash: string | null; commitSha: string | null }> {
     const cfg = globalConfig;
@@ -239,15 +240,26 @@ const plugin: Plugin = async ({ client, directory }) => {
           // All same — nothing to add
         } else if (!localUpdated && !matchesLoaded) {
           // loaded == current, remote is different → update available
-          lines.push(`  🆕 Update available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
-          lines.push(`     Run /ac global update then /ac reload`);
+          if (cacheAlreadyCleared) {
+            lines.push(`  🆕 Update ready: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+            lines.push(`     Restart opencode to load the new version`);
+          } else {
+            lines.push(`  🆕 Update available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+            lines.push(`     Run /ac global update then restart opencode`);
+          }
         } else if (localUpdated && matchesCurrent) {
           // Already updated locally, matches remote — just needs reload (already shown above)
         } else if (localUpdated && !matchesCurrent && !matchesLoaded) {
           // All three differ: loaded ≠ current ≠ remote
-          lines.push(`  🆕 Newer version available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
-          lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
-          lines.push(`     Run /ac global update then restart opencode`);
+          if (cacheAlreadyCleared) {
+            lines.push(`  🆕 Newer version available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+            lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
+            lines.push(`     Restart opencode to load the new version`);
+          } else {
+            lines.push(`  🆕 Newer version available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+            lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
+            lines.push(`     Run /ac global update then restart opencode`);
+          }
         }
       }
     }
@@ -643,8 +655,9 @@ const plugin: Plugin = async ({ client, directory }) => {
             `   Commit: ${shortSha}`,
             cacheCleared ? "   Cleared cached module." : "   No cached module found.",
             "",
-            "   Restart OpenCode to load the new version.",
+            "   Restart opencode to load the new version.",
           ];
+          cacheAlreadyCleared = true;
           await sendMessage(sessionID, msg.join("\n"));
         } catch (err: unknown) {
           if (err instanceof Error && err.message === "__AUTO_CONTINUE_HANDLED__") throw err;
