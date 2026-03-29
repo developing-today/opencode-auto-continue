@@ -235,6 +235,22 @@ const plugin = async ({ client, directory }) => {
         }
     }
     // ── Command UI helpers ──────────────────────────────────────────────────
+    function overrideLines(overrides) {
+        const parts = [];
+        if (overrides.enabled !== undefined)
+            parts.push(`enabled: ${overrides.enabled}`);
+        if (overrides.cooldownMs !== undefined)
+            parts.push(`cooldown: ${overrides.cooldownMs}ms`);
+        if (overrides.delayMs !== undefined)
+            parts.push(`delay: ${overrides.delayMs}ms`);
+        if (overrides.maxConsecutive !== undefined)
+            parts.push(`max: ${overrides.maxConsecutive}`);
+        return [
+            "",
+            `  Session overrides: ${parts.join(" · ")}`,
+            `  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive}`,
+        ];
+    }
     async function helpText(sessionID) {
         const cfg = getEffectiveConfig(sessionID);
         const overrides = sessionConfigs.get(sessionID);
@@ -249,17 +265,7 @@ const plugin = async ({ client, directory }) => {
             `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
         ];
         if (overrides && Object.keys(overrides).length > 0) {
-            const parts = [];
-            if (overrides.enabled !== undefined)
-                parts.push(`enabled: ${overrides.enabled}`);
-            if (overrides.cooldownMs !== undefined)
-                parts.push(`cooldown: ${overrides.cooldownMs}ms`);
-            if (overrides.delayMs !== undefined)
-                parts.push(`delay: ${overrides.delayMs}ms`);
-            if (overrides.maxConsecutive !== undefined)
-                parts.push(`max: ${overrides.maxConsecutive}`);
-            lines.push(`  Session overrides: ${parts.join(" · ")}`);
-            lines.push(`  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive}`);
+            lines.push(...overrideLines(overrides));
         }
         lines.push("", "  /auto-continue on|off          Enable/disable (session)", "  /auto-continue cooldown <ms>   Set cooldown (session)", "  /auto-continue delay <ms>      Set delay (session)", "  /auto-continue max <n>         Set max retries (session)", "  /auto-continue status          Show current settings", "  /auto-continue reset           Clear session overrides", "  /auto-continue reload           Reload global config from disk", "  /auto-continue global <cmd>    Persist setting to config file", "  /auto-continue global update   Clear cache to fetch latest version", "  /auto-continue help            Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
         return lines.join("\n");
@@ -394,10 +400,10 @@ const plugin = async ({ client, directory }) => {
                     }
                     const release = (await response.json());
                     const body = release.body || "";
-                    const lines = body.split("\n");
+                    const bodyLines = body.split("\n");
                     // First line is the sha512 SRI hash, "Commit: <sha>" is on a later line
-                    const remoteHash = lines[0]?.startsWith("sha512-") ? lines[0].trim() : null;
-                    const commitLine = lines.find((l) => l.startsWith("Commit: "));
+                    const remoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
+                    const commitLine = bodyLines.find((l) => l.startsWith("Commit: "));
                     const commitSha = commitLine?.replace("Commit: ", "").trim();
                     const shortSha = commitSha?.substring(0, 7) ?? "unknown";
                     const remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";

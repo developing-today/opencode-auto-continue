@@ -267,6 +267,19 @@ const plugin: Plugin = async ({ client, directory }) => {
 
   // ── Command UI helpers ──────────────────────────────────────────────────
 
+  function overrideLines(overrides: Partial<Config>): string[] {
+    const parts: string[] = [];
+    if (overrides.enabled !== undefined) parts.push(`enabled: ${overrides.enabled}`);
+    if (overrides.cooldownMs !== undefined) parts.push(`cooldown: ${overrides.cooldownMs}ms`);
+    if (overrides.delayMs !== undefined) parts.push(`delay: ${overrides.delayMs}ms`);
+    if (overrides.maxConsecutive !== undefined) parts.push(`max: ${overrides.maxConsecutive}`);
+    return [
+      "",
+      `  Session overrides: ${parts.join(" · ")}`,
+      `  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive}`,
+    ];
+  }
+
   async function helpText(sessionID: string): Promise<string> {
     const cfg = getEffectiveConfig(sessionID);
     const overrides = sessionConfigs.get(sessionID);
@@ -282,15 +295,7 @@ const plugin: Plugin = async ({ client, directory }) => {
     ];
 
     if (overrides && Object.keys(overrides).length > 0) {
-      const parts: string[] = [];
-      if (overrides.enabled !== undefined) parts.push(`enabled: ${overrides.enabled}`);
-      if (overrides.cooldownMs !== undefined) parts.push(`cooldown: ${overrides.cooldownMs}ms`);
-      if (overrides.delayMs !== undefined) parts.push(`delay: ${overrides.delayMs}ms`);
-      if (overrides.maxConsecutive !== undefined) parts.push(`max: ${overrides.maxConsecutive}`);
-      lines.push(`  Session overrides: ${parts.join(" · ")}`);
-      lines.push(
-        `  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive}`,
-      );
+      lines.push(...overrideLines(overrides));
     }
 
     lines.push(
@@ -467,11 +472,11 @@ const plugin: Plugin = async ({ client, directory }) => {
           }
           const release = (await response.json()) as { body?: string; tag_name?: string };
           const body = release.body || "";
-          const lines = body.split("\n");
+          const bodyLines = body.split("\n");
 
           // First line is the sha512 SRI hash, "Commit: <sha>" is on a later line
-          const remoteHash = lines[0]?.startsWith("sha512-") ? lines[0].trim() : null;
-          const commitLine = lines.find((l: string) => l.startsWith("Commit: "));
+          const remoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
+          const commitLine = bodyLines.find((l: string) => l.startsWith("Commit: "));
           const commitSha = commitLine?.replace("Commit: ", "").trim();
           const shortSha = commitSha?.substring(0, 7) ?? "unknown";
           const remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
