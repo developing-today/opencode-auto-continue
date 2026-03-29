@@ -15,7 +15,7 @@ OpenCode plugin that automatically sends "continue" when bad request (HTTP 400) 
 Add to the `plugin` array in your `opencode.jsonc`:
 
 ```
-opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz
+"opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz",
 ```
 
 ```jsonc
