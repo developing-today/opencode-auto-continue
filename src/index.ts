@@ -490,7 +490,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       };
       opencodeConfig.command["ac"] = {
         template: "",
-        description: "Alias for /auto-continue",
+        description: "Manage auto-continue settings (on/off, cooldown, delay, max, reload)",
       };
     },
 
