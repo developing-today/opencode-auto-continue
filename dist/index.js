@@ -1,4 +1,4 @@
-import { readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_FILE = `${PLUGIN_NAME}.jsonc`;
@@ -291,9 +291,23 @@ const plugin = async ({ client, directory }) => {
         }
         // ── Reload (re-read global config from disk) ──
         if (subcmd === "reload") {
+            const configPath = join(directory, CONFIG_FILE);
+            let fileExists = false;
+            try {
+                await access(configPath);
+                fileExists = true;
+            }
+            catch {
+                // File doesn't exist
+            }
             const reloaded = await loadConfig(directory, log);
             Object.assign(globalConfig, reloaded);
-            await sendMessage(sessionID, `Global config reloaded from disk.\n${JSON.stringify(globalConfig, null, 2)}`);
+            if (fileExists) {
+                await sendMessage(sessionID, `Global config reloaded from ${CONFIG_FILE}.\n${JSON.stringify(globalConfig, null, 2)}`);
+            }
+            else {
+                await sendMessage(sessionID, `No ${CONFIG_FILE} found — using defaults.\n${JSON.stringify(globalConfig, null, 2)}`);
+            }
             throw new Error("__AUTO_CONTINUE_HANDLED__");
         }
         // ── Reset (clear session overrides) ──
