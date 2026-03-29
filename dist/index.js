@@ -3,7 +3,8 @@ import { join } from "node:path";
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_FILE = `${PLUGIN_NAME}.jsonc`;
 const GITHUB_REPO = "developing-today/opencode-auto-continue";
-const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/commits/main`;
+const GITHUB_API_COMMITS = `https://api.github.com/repos/${GITHUB_REPO}/commits/main`;
+const GITHUB_API_RELEASE = `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/latest`;
 // ─── Content hash from bun.lock ─────────────────────────────────────────────
 function readContentHashFromLock(raw) {
     const pattern = new RegExp(`"${PLUGIN_NAME}":\\s*\\[.*?,\\s*"(sha512-[^"]+)"`);
@@ -374,21 +375,30 @@ const plugin = async ({ client, directory }) => {
             if (globalSub === "update") {
                 try {
                     await sendMessage(sessionID, "Checking for updates...");
-                    // 1. Fetch latest commit SHA from GitHub API
-                    const response = await fetch(GITHUB_API_URL, {
+                    // 1. Fetch latest release metadata — has both commit SHA and content hash
+                    const response = await fetch(GITHUB_API_RELEASE, {
                         headers: { "User-Agent": PLUGIN_NAME },
                     });
                     if (!response.ok) {
                         await sendMessage(sessionID, `❌ GitHub API returned ${response.status}: ${response.statusText}`);
                         throw new Error("__AUTO_CONTINUE_HANDLED__");
                     }
-                    const data = (await response.json());
-                    const latestSha = data.sha;
-                    if (!latestSha || latestSha.length < 7) {
-                        await sendMessage(sessionID, "❌ Failed to parse commit SHA from GitHub response.");
+                    const release = (await response.json());
+                    const body = release.body || "";
+                    const lines = body.split("\n");
+                    // First line is the sha512 SRI hash, "Commit: <sha>" is on a later line
+                    const remoteHash = lines[0]?.startsWith("sha512-") ? lines[0].trim() : null;
+                    const commitLine = lines.find((l) => l.startsWith("Commit: "));
+                    const commitSha = commitLine?.replace("Commit: ", "").trim();
+                    const shortSha = commitSha?.substring(0, 7) ?? "unknown";
+                    const remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
+                    // Compare with currently loaded hash
+                    const currentShort = loadedHash ? shortHash(loadedHash) : "unknown";
+                    const isUpToDate = loadedHash && remoteHash && loadedHash === remoteHash;
+                    if (isUpToDate) {
+                        await sendMessage(sessionID, [`✅ Already up to date.`, `   Commit: ${shortSha} · Hash: ${currentShort}`].join("\n"));
                         throw new Error("__AUTO_CONTINUE_HANDLED__");
                     }
-                    const shortSha = latestSha.substring(0, 7);
                     // 2. Clear OpenCode's cached module and dependency entry so it re-installs on restart
                     const home = process.env.HOME || process.env.USERPROFILE || "";
                     const opencodeCacheDir = join(home, ".cache", "opencode");
@@ -435,14 +445,14 @@ const plugin = async ({ client, directory }) => {
                     catch {
                         // Cache dir might not exist — not critical
                     }
-                    const lines = [
-                        `✅ Cache cleared. Latest commit on main: ${shortSha}`,
-                        cacheCleared ? "   Removed cached module." : "   No cached module found.",
-                        "   The 'latest' tag tarball will be re-fetched on next restart.",
+                    const msg = [
+                        `✅ Update available: ${currentShort} → ${remoteShort}`,
+                        `   Commit: ${shortSha}`,
+                        cacheCleared ? "   Cleared cached module." : "   No cached module found.",
                         "",
                         "   Restart OpenCode to load the new version.",
                     ];
-                    await sendMessage(sessionID, lines.join("\n"));
+                    await sendMessage(sessionID, msg.join("\n"));
                 }
                 catch (err) {
                     if (err instanceof Error && err.message === "__AUTO_CONTINUE_HANDLED__")
