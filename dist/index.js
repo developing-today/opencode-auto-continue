@@ -18,7 +18,7 @@ const DEFAULTS = {
     enabled: true,
 };
 // ─── Helpers ────────────────────────────────────────────────────────────────
-function stripJsoncComments(text) {
+function parseJsonc(text) {
     let result = "";
     let inString = false;
     let stringChar = "";
@@ -59,13 +59,15 @@ function stripJsoncComments(text) {
             }
         }
     }
-    return result;
+    // Strip trailing commas before } or ]
+    result = result.replace(/,\s*([}\]])/g, "$1");
+    return JSON.parse(result);
 }
 async function loadConfig(directory, log) {
     const configPath = join(directory, CONFIG_FILE);
     try {
         const raw = await readFile(configPath, "utf-8");
-        const parsed = JSON.parse(stripJsoncComments(raw));
+        const parsed = parseJsonc(raw);
         const config = { ...DEFAULTS };
         if (typeof parsed.cooldownMs === "number")
             config.cooldownMs = parsed.cooldownMs;

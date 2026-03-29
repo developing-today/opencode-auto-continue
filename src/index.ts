@@ -37,7 +37,7 @@ interface SessionState {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function stripJsoncComments(text: string): string {
+function parseJsonc(text: string): unknown {
   let result = "";
   let inString = false;
   let stringChar = "";
@@ -72,14 +72,16 @@ function stripJsoncComments(text: string): string {
       }
     }
   }
-  return result;
+  // Strip trailing commas before } or ]
+  result = result.replace(/,\s*([}\]])/g, "$1");
+  return JSON.parse(result);
 }
 
 async function loadConfig(directory: string, log: (msg: string) => void): Promise<Config> {
   const configPath = join(directory, CONFIG_FILE);
   try {
     const raw = await readFile(configPath, "utf-8");
-    const parsed = JSON.parse(stripJsoncComments(raw));
+    const parsed = parseJsonc(raw) as Record<string, unknown>;
     const config: Config = { ...DEFAULTS };
 
     if (typeof parsed.cooldownMs === "number") config.cooldownMs = parsed.cooldownMs;
