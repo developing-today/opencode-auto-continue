@@ -9,26 +9,27 @@ const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/commits/main
 
 // ─── Content hash from bun.lock ─────────────────────────────────────────────
 
-let cachedContentHash: string | null = null;
+function readContentHashFromLock(raw: string): string | null {
+  const pattern = new RegExp(`"${PLUGIN_NAME}":\\s*\\[.*?,\\s*"(sha512-[^"]+)"`);
+  const match = raw.match(pattern);
+  return match?.[1] ?? null;
+}
 
-async function getContentHash(): Promise<string> {
-  if (cachedContentHash !== null) return cachedContentHash;
+function shortHash(hash: string): string {
+  // "sha512-+fPJGSdlt..." → first 12 chars after "sha512-"
+  const body = hash.startsWith("sha512-") ? hash.slice(7) : hash;
+  return body.slice(0, 12);
+}
+
+async function readBunLockHash(): Promise<string | null> {
   try {
     const home = process.env.HOME || process.env.USERPROFILE || "";
     const lockPath = join(home, ".cache", "opencode", "bun.lock");
     const raw = await readFile(lockPath, "utf-8");
-    // Find the resolved entry line: "opencode-auto-continue": ["opencode-auto-continue@...", {...}, "sha512-..."]
-    const pattern = new RegExp(`"${PLUGIN_NAME}":\\s*\\[.*?,\\s*"(sha512-[^"]+)"`);
-    const match = raw.match(pattern);
-    if (match?.[1]) {
-      cachedContentHash = match[1];
-      return cachedContentHash;
-    }
+    return readContentHashFromLock(raw);
   } catch {
-    // Not critical
+    return null;
   }
-  cachedContentHash = "unknown";
-  return cachedContentHash;
 }
 
 /**
@@ -168,6 +169,23 @@ const plugin: Plugin = async ({ client, directory }) => {
   // Global config — loaded from file, mutated by /auto-continue global commands
   const globalConfig = await loadConfig(directory, log);
 
+  // Snapshot content hash at load time
+  const loadedHash = await readBunLockHash();
+  log(`Loaded with content hash: ${loadedHash ?? "unknown"}`);
+
+  // Version info for display
+  async function versionInfo(): Promise<string> {
+    const loadedShort = loadedHash ? shortHash(loadedHash) : "unknown";
+    const currentHash = await readBunLockHash();
+    const currentShort = currentHash ? shortHash(currentHash) : "unknown";
+
+    if (!loadedHash || !currentHash || loadedHash === currentHash) {
+      return loadedShort;
+    }
+    // Hashes differ — update installed but not loaded
+    return `${loadedShort}\n  ⚠️  *needs opencode reload* (bun: ${currentShort})`;
+  }
+
   // Merge global config with per-session overrides
   function getEffectiveConfig(sessionID?: string): Config {
     if (!sessionID) return globalConfig;
@@ -251,13 +269,13 @@ const plugin: Plugin = async ({ client, directory }) => {
   async function helpText(sessionID: string): Promise<string> {
     const cfg = getEffectiveConfig(sessionID);
     const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
-    const hash = await getContentHash();
+    const ver = await versionInfo();
     return [
       "╭──────────────────────────────────────────╮",
       "│       Auto-Continue Commands             │",
       "╰──────────────────────────────────────────╯",
       "",
-      `  Status: ${status} · ${hash}`,
+      `  Status: ${status} · ${ver}`,
       `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
       "",
       "  /auto-continue on|off          Enable/disable (session)",
@@ -279,13 +297,13 @@ const plugin: Plugin = async ({ client, directory }) => {
     const cfg = getEffectiveConfig(sessionID);
     const overrides = sessionConfigs.get(sessionID);
     const state = sessions.get(sessionID);
-    const hash = await getContentHash();
+    const ver = await versionInfo();
     return [
       "╭──────────────────────────────────────────╮",
       "│       Auto-Continue Status               │",
       "╰──────────────────────────────────────────╯",
       "",
-      `  Version:      ${hash}`,
+      `  Version:      ${ver}`,
       `  Enabled:      ${cfg.enabled ? "✅ yes" : "❌ no"}`,
       `  Cooldown:     ${cfg.cooldownMs}ms`,
       `  Delay:        ${cfg.delayMs}ms`,
