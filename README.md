@@ -37,35 +37,37 @@ The plugin registers `/auto-continue` (and `/ac` as a shorthand alias) for manag
 
 | Command | Description |
 |---------|-------------|
-| `/auto-continue` | Show help menu with current status |
+| `/auto-continue` | Show help menu with current status and version check |
 | `/auto-continue on\|off` | Enable/disable for current session |
 | `/auto-continue cooldown <ms>` | Set cooldown between retries (session) |
 | `/auto-continue delay <ms>` | Set delay before sending continue (session) |
 | `/auto-continue max <n>` | Set max consecutive retries (session) |
-| `/auto-continue status` | Show full status and config details |
+| `/auto-continue check-interval <ms>` | Set version check debounce (session) |
+| `/auto-continue status` | Show full status, config details, and version check |
 | `/auto-continue reload` | Reload global config from disk |
 | `/auto-continue reset` | Clear session overrides, revert to global |
 | `/auto-continue global on\|off` | Enable/disable globally (writes config) |
 | `/auto-continue global cooldown <ms>` | Set global cooldown (writes config) |
 | `/auto-continue global delay <ms>` | Set global delay (writes config) |
 | `/auto-continue global max <n>` | Set global max retries (writes config) |
+| `/auto-continue global check-interval <ms>` | Set global version check debounce (writes config) |
 | `/auto-continue global update` | Clear cache to fetch latest version |
 
 All commands also work with `/ac` (e.g., `/ac status`, `/ac on`, `/ac global update`).
 
 ### Session vs Global
 
-- **Session commands** (`on`, `off`, `cooldown`, `delay`, `max`) change settings for the current session only. They override global settings and are lost when the session ends.
-- **Global commands** (`global on`, `global off`, `global cooldown`, etc.) write to the config file on disk, affecting all future sessions.
+- **Session commands** (`on`, `off`, `cooldown`, `delay`, `max`, `check-interval`) change settings for the current session only. They override global settings and are lost when the session ends.
+- **Global commands** (`global on`, `global off`, `global cooldown`, `global check-interval`, etc.) write to the config file on disk, affecting all future sessions.
 - **`reload`** re-reads the config file from disk into the running plugin (useful if you edited the file manually).
 - **`global update`** clears the cached module so the latest version is re-fetched from the `latest` tag on next restart.
 - **`reset`** clears session overrides so the session falls back to global config.
 
 ## Configuration (Optional)
 
-A config file is **not required**. The plugin works out of the box with sensible defaults. You only need a config file if you want to change the default settings globally without using the `/auto-continue global` command.
+A config file is **not required**. The plugin works out of the box with sensible defaults. You only need a config file if you want to change the defaults without using the `/auto-continue global` command.
 
-Create `opencode-auto-continue.jsonc` in your `.opencode/` directory:
+Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The following shows the current defaults — you only need to include the settings you want to change:
 
 ```jsonc
 {
@@ -79,7 +81,12 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory:
   "maxConsecutive": 5,
 
   // Set to false to disable the plugin without removing it
-  "enabled": true
+  "enabled": true,
+
+  // Minimum ms between remote version checks (debounce).
+  // The plugin only checks for new versions when you run /ac, /ac status,
+  // or /auto-continue — this controls how often that check hits GitHub.
+  "checkIntervalMs": 30000
 }
 ```
 
@@ -89,8 +96,9 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory:
 | `delayMs` | number | `2000` | Delay after session idle before sending continue |
 | `maxConsecutive` | number | `5` | Max consecutive auto-continues before giving up |
 | `enabled` | boolean | `true` | Set `false` to disable without removing from plugin list |
+| `checkIntervalMs` | number | `30000` | Debounce for remote version checks (ms). Version is only checked when you run `/ac`, `/ac status`, or `/auto-continue` — this limits how often that check hits GitHub. |
 
-All fields are optional — missing keys use defaults. You can also manage these settings at runtime via `/auto-continue global <setting> <value>`.
+All fields are optional — omitted keys use the defaults shown above. You can also manage these settings at runtime via `/auto-continue global <setting> <value>`.
 
 ## Logs
 
