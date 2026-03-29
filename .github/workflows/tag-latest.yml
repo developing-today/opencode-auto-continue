@@ -24,20 +24,30 @@ jobs:
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
           echo "dated_tag=$DATED_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Compute content hash (same as bun uses)
-        id: hash
-        run: |
-          # Download the tarball GitHub generates for this commit and compute sha512
-          TARBALL_URL="https://github.com/${{ github.repository }}/archive/${GITHUB_SHA}.tar.gz"
-          HASH=$(curl -sL "$TARBALL_URL" | openssl dgst -sha512 -binary | openssl base64 -A)
-          SRI="sha512-${HASH}"
-          echo "content_hash=$SRI" >> "$GITHUB_OUTPUT"
-
       - name: Push tags
         run: |
           git tag -f latest HEAD
           git tag "${{ steps.vars.outputs.dated_tag }}" HEAD
           git push origin latest "${{ steps.vars.outputs.dated_tag }}" --force
+
+      - name: Compute content hash from tag tarball (same URL bun downloads)
+        id: hash
+        run: |
+          # Must use the refs/tags/latest URL — same tarball bun fetches
+          # The root dir in the tar is "opencode-auto-continue-latest/" vs
+          # "opencode-auto-continue-<sha>/" for commit URLs, so hashes differ.
+          TARBALL_URL="https://github.com/${{ github.repository }}/archive/refs/tags/latest.tar.gz"
+          # Retry a few times in case GitHub hasn't updated the tag tarball yet
+          for i in 1 2 3 4 5; do
+            HASH=$(curl -sL "$TARBALL_URL" | openssl dgst -sha512 -binary | openssl base64 -A)
+            if [ -n "$HASH" ]; then
+              break
+            fi
+            echo "Attempt $i: empty hash, retrying in 2s..."
+            sleep 2
+          done
+          SRI="sha512-${HASH}"
+          echo "content_hash=$SRI" >> "$GITHUB_OUTPUT"
 
       - name: Create dated release (marked as latest)
         env:
