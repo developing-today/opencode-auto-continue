@@ -213,9 +213,12 @@ const plugin = async ({ client, directory }) => {
             "  /auto-continue max <n>         Set max retries (session)",
             "  /auto-continue status          Show current settings",
             "  /auto-continue reset           Clear session overrides",
+            "  /auto-continue reload           Reload global config from disk",
             "  /auto-continue global <cmd>    Persist setting to config file",
             "  /auto-continue global update   Clear cache to fetch latest version",
             "  /auto-continue help            Show this help",
+            "",
+            "  Alias: /ac (same commands, e.g. /ac status)",
         ].join("\n");
     }
     function statusText(sessionID) {
@@ -242,191 +245,206 @@ const plugin = async ({ client, directory }) => {
         ].join("\n");
     }
     // ── Hooks ───────────────────────────────────────────────────────────────
-    return {
-        // Register the /auto-continue slash command
-        config: async (opencodeConfig) => {
-            opencodeConfig.command ??= {};
-            opencodeConfig.command["auto-continue"] = {
-                template: "",
-                description: "Manage auto-continue settings (on/off, cooldown, delay, max)",
+    // Extracted command handler shared by /auto-continue and /ac
+    async function handleCommand(input) {
+        const args = (input.arguments || "").trim().split(/\s+/).filter(Boolean);
+        const subcmd = args[0]?.toLowerCase() || "";
+        const sessionID = input.sessionID;
+        // ── Help (default) ──
+        if (!subcmd || subcmd === "help") {
+            await sendMessage(sessionID, helpText(sessionID));
+            throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+        // ── On / Off ──
+        if (subcmd === "on" || subcmd === "off") {
+            const enabled = subcmd === "on";
+            const overrides = sessionConfigs.get(sessionID) || {};
+            overrides.enabled = enabled;
+            sessionConfigs.set(sessionID, overrides);
+            await sendMessage(sessionID, `Auto-continue ${enabled ? "✅ enabled" : "❌ disabled"} for this session.`);
+            throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+        // ── Cooldown / Delay / Max ──
+        if (subcmd === "cooldown" || subcmd === "delay" || subcmd === "max") {
+            const value = parseInt(args[1], 10);
+            if (isNaN(value) || value < 0) {
+                await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue ${subcmd} <number>`);
+                throw new Error("__AUTO_CONTINUE_HANDLED__");
+            }
+            const overrides = sessionConfigs.get(sessionID) || {};
+            const keyMap = {
+                cooldown: "cooldownMs",
+                delay: "delayMs",
+                max: "maxConsecutive",
             };
-        },
-        // Handle /auto-continue subcommands
-        "command.execute.before": async (input, _output) => {
-            if (input.command !== "auto-continue")
-                return;
-            const args = (input.arguments || "").trim().split(/\s+/).filter(Boolean);
-            const subcmd = args[0]?.toLowerCase() || "";
-            const sessionID = input.sessionID;
-            // ── Help (default) ──
-            if (!subcmd || subcmd === "help") {
-                await sendMessage(sessionID, helpText(sessionID));
+            overrides[keyMap[subcmd]] = value;
+            sessionConfigs.set(sessionID, overrides);
+            const label = subcmd === "cooldown" ? "Cooldown" : subcmd === "delay" ? "Delay" : "Max consecutive";
+            const unit = subcmd === "max" ? "" : "ms";
+            await sendMessage(sessionID, `${label} set to ${value}${unit} for this session.`);
+            throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+        // ── Status ──
+        if (subcmd === "status") {
+            await sendMessage(sessionID, statusText(sessionID));
+            throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+        // ── Reload (re-read global config from disk) ──
+        if (subcmd === "reload") {
+            const reloaded = await loadConfig(directory, log);
+            Object.assign(globalConfig, reloaded);
+            await sendMessage(sessionID, `Global config reloaded from disk.\n${JSON.stringify(globalConfig, null, 2)}`);
+            throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+        // ── Reset (clear session overrides) ──
+        if (subcmd === "reset") {
+            sessionConfigs.delete(sessionID);
+            await sendMessage(sessionID, "Session overrides cleared. Using global config.");
+            throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+        // ── Global ──
+        if (subcmd === "global") {
+            const globalSub = args[1]?.toLowerCase() || "";
+            // ── Global Update: clear cached module so next restart fetches latest ──
+            if (globalSub === "update") {
+                try {
+                    await sendMessage(sessionID, "Checking for updates...");
+                    // 1. Fetch latest commit SHA from GitHub API
+                    const response = await fetch(GITHUB_API_URL, {
+                        headers: { "User-Agent": PLUGIN_NAME },
+                    });
+                    if (!response.ok) {
+                        await sendMessage(sessionID, `❌ GitHub API returned ${response.status}: ${response.statusText}`);
+                        throw new Error("__AUTO_CONTINUE_HANDLED__");
+                    }
+                    const data = (await response.json());
+                    const latestSha = data.sha;
+                    if (!latestSha || latestSha.length < 7) {
+                        await sendMessage(sessionID, "❌ Failed to parse commit SHA from GitHub response.");
+                        throw new Error("__AUTO_CONTINUE_HANDLED__");
+                    }
+                    const shortSha = latestSha.substring(0, 7);
+                    // 2. Clear OpenCode's cached module and dependency entry so it re-installs on restart
+                    const home = process.env.HOME || process.env.USERPROFILE || "";
+                    const opencodeCacheDir = join(home, ".cache", "opencode");
+                    let cacheCleared = false;
+                    // Remove the cached node_modules entry
+                    try {
+                        const cachedMod = join(opencodeCacheDir, "node_modules", PLUGIN_NAME);
+                        await rm(cachedMod, { recursive: true, force: true });
+                        cacheCleared = true;
+                    }
+                    catch {
+                        // Not critical if missing
+                    }
+                    // Remove from OpenCode's cache package.json so it triggers reinstall
+                    try {
+                        const pkgJsonPath = join(opencodeCacheDir, "package.json");
+                        const raw = await readFile(pkgJsonPath, "utf-8");
+                        const parsed = JSON.parse(raw);
+                        if (parsed.dependencies?.[PLUGIN_NAME]) {
+                            delete parsed.dependencies[PLUGIN_NAME];
+                            await writeFile(pkgJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
+                        }
+                    }
+                    catch {
+                        // Not critical
+                    }
+                    // Remove bun.lock to avoid stale resolution
+                    try {
+                        await rm(join(opencodeCacheDir, "bun.lock"), { force: true });
+                    }
+                    catch {
+                        // Not critical
+                    }
+                    // Also clear bun's own install cache
+                    try {
+                        const bunCacheDir = join(home, ".cache", ".bun", "install", "cache");
+                        const entries = await readdir(bunCacheDir);
+                        for (const entry of entries) {
+                            if (entry.includes("developing-today-opencode-auto-continue") || entry === PLUGIN_NAME) {
+                                await rm(join(bunCacheDir, entry), { recursive: true, force: true });
+                            }
+                        }
+                    }
+                    catch {
+                        // Cache dir might not exist — not critical
+                    }
+                    const lines = [
+                        `✅ Cache cleared. Latest commit on main: ${shortSha}`,
+                        cacheCleared ? "   Removed cached module." : "   No cached module found.",
+                        "   The 'latest' tag tarball will be re-fetched on next restart.",
+                        "",
+                        "   Restart OpenCode to load the new version.",
+                    ];
+                    await sendMessage(sessionID, lines.join("\n"));
+                }
+                catch (err) {
+                    if (err instanceof Error && err.message === "__AUTO_CONTINUE_HANDLED__")
+                        throw err;
+                    await sendMessage(sessionID, `❌ Update failed: ${err}`);
+                }
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
             }
-            // ── On / Off ──
-            if (subcmd === "on" || subcmd === "off") {
-                const enabled = subcmd === "on";
-                const overrides = sessionConfigs.get(sessionID) || {};
-                overrides.enabled = enabled;
-                sessionConfigs.set(sessionID, overrides);
-                await sendMessage(sessionID, `Auto-continue ${enabled ? "✅ enabled" : "❌ disabled"} for this session.`);
+            if (globalSub === "on" || globalSub === "off") {
+                globalConfig.enabled = globalSub === "on";
+                await writeGlobalConfig();
+                await sendMessage(sessionID, `Global config: auto-continue ${globalSub === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`);
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
             }
-            // ── Cooldown / Delay / Max ──
-            if (subcmd === "cooldown" || subcmd === "delay" || subcmd === "max") {
-                const value = parseInt(args[1], 10);
+            if (globalSub === "cooldown" || globalSub === "delay" || globalSub === "max") {
+                const value = parseInt(args[2], 10);
                 if (isNaN(value) || value < 0) {
-                    await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue ${subcmd} <number>`);
+                    await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue global ${globalSub} <number>`);
                     throw new Error("__AUTO_CONTINUE_HANDLED__");
                 }
-                const overrides = sessionConfigs.get(sessionID) || {};
                 const keyMap = {
                     cooldown: "cooldownMs",
                     delay: "delayMs",
                     max: "maxConsecutive",
                 };
-                overrides[keyMap[subcmd]] = value;
-                sessionConfigs.set(sessionID, overrides);
-                const label = subcmd === "cooldown" ? "Cooldown" : subcmd === "delay" ? "Delay" : "Max consecutive";
-                const unit = subcmd === "max" ? "" : "ms";
-                await sendMessage(sessionID, `${label} set to ${value}${unit} for this session.`);
+                globalConfig[keyMap[globalSub]] = value;
+                await writeGlobalConfig();
+                const label = globalSub === "cooldown" ? "Cooldown" : globalSub === "delay" ? "Delay" : "Max consecutive";
+                const unit = globalSub === "max" ? "" : "ms";
+                await sendMessage(sessionID, `Global config: ${label} set to ${value}${unit}. Written to ${CONFIG_FILE}.`);
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
             }
-            // ── Status ──
-            if (subcmd === "status") {
-                await sendMessage(sessionID, statusText(sessionID));
-                throw new Error("__AUTO_CONTINUE_HANDLED__");
-            }
-            // ── Reset (clear session overrides) ──
-            if (subcmd === "reset") {
-                sessionConfigs.delete(sessionID);
-                await sendMessage(sessionID, "Session overrides cleared. Using global config.");
-                throw new Error("__AUTO_CONTINUE_HANDLED__");
-            }
-            // ── Global ──
-            if (subcmd === "global") {
-                const globalSub = args[1]?.toLowerCase() || "";
-                // ── Global Update: clear cached module so next restart fetches latest ──
-                if (globalSub === "update") {
-                    try {
-                        await sendMessage(sessionID, "Checking for updates...");
-                        // 1. Fetch latest commit SHA from GitHub API
-                        const response = await fetch(GITHUB_API_URL, {
-                            headers: { "User-Agent": PLUGIN_NAME },
-                        });
-                        if (!response.ok) {
-                            await sendMessage(sessionID, `❌ GitHub API returned ${response.status}: ${response.statusText}`);
-                            throw new Error("__AUTO_CONTINUE_HANDLED__");
-                        }
-                        const data = (await response.json());
-                        const latestSha = data.sha;
-                        if (!latestSha || latestSha.length < 7) {
-                            await sendMessage(sessionID, "❌ Failed to parse commit SHA from GitHub response.");
-                            throw new Error("__AUTO_CONTINUE_HANDLED__");
-                        }
-                        const shortSha = latestSha.substring(0, 7);
-                        // 2. Clear OpenCode's cached module and dependency entry so it re-installs on restart
-                        const home = process.env.HOME || process.env.USERPROFILE || "";
-                        const opencodeCacheDir = join(home, ".cache", "opencode");
-                        let cacheCleared = false;
-                        // Remove the cached node_modules entry
-                        try {
-                            const cachedMod = join(opencodeCacheDir, "node_modules", PLUGIN_NAME);
-                            await rm(cachedMod, { recursive: true, force: true });
-                            cacheCleared = true;
-                        }
-                        catch {
-                            // Not critical if missing
-                        }
-                        // Remove from OpenCode's cache package.json so it triggers reinstall
-                        try {
-                            const pkgJsonPath = join(opencodeCacheDir, "package.json");
-                            const raw = await readFile(pkgJsonPath, "utf-8");
-                            const parsed = JSON.parse(raw);
-                            if (parsed.dependencies?.[PLUGIN_NAME]) {
-                                delete parsed.dependencies[PLUGIN_NAME];
-                                await writeFile(pkgJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
-                            }
-                        }
-                        catch {
-                            // Not critical
-                        }
-                        // Remove bun.lock to avoid stale resolution
-                        try {
-                            await rm(join(opencodeCacheDir, "bun.lock"), { force: true });
-                        }
-                        catch {
-                            // Not critical
-                        }
-                        // Also clear bun's own install cache
-                        try {
-                            const bunCacheDir = join(home, ".cache", ".bun", "install", "cache");
-                            const entries = await readdir(bunCacheDir);
-                            for (const entry of entries) {
-                                if (entry.includes("developing-today-opencode-auto-continue") || entry === PLUGIN_NAME) {
-                                    await rm(join(bunCacheDir, entry), { recursive: true, force: true });
-                                }
-                            }
-                        }
-                        catch {
-                            // Cache dir might not exist — not critical
-                        }
-                        const lines = [
-                            `✅ Cache cleared. Latest commit on main: ${shortSha}`,
-                            cacheCleared ? "   Removed cached module." : "   No cached module found.",
-                            "   The 'latest' tag tarball will be re-fetched on next restart.",
-                            "",
-                            "   Restart OpenCode to load the new version.",
-                        ];
-                        await sendMessage(sessionID, lines.join("\n"));
-                    }
-                    catch (err) {
-                        if (err instanceof Error && err.message === "__AUTO_CONTINUE_HANDLED__")
-                            throw err;
-                        await sendMessage(sessionID, `❌ Update failed: ${err}`);
-                    }
-                    throw new Error("__AUTO_CONTINUE_HANDLED__");
-                }
-                if (globalSub === "on" || globalSub === "off") {
-                    globalConfig.enabled = globalSub === "on";
-                    await writeGlobalConfig();
-                    await sendMessage(sessionID, `Global config: auto-continue ${globalSub === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`);
-                    throw new Error("__AUTO_CONTINUE_HANDLED__");
-                }
-                if (globalSub === "cooldown" || globalSub === "delay" || globalSub === "max") {
-                    const value = parseInt(args[2], 10);
-                    if (isNaN(value) || value < 0) {
-                        await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue global ${globalSub} <number>`);
-                        throw new Error("__AUTO_CONTINUE_HANDLED__");
-                    }
-                    const keyMap = {
-                        cooldown: "cooldownMs",
-                        delay: "delayMs",
-                        max: "maxConsecutive",
-                    };
-                    globalConfig[keyMap[globalSub]] = value;
-                    await writeGlobalConfig();
-                    const label = globalSub === "cooldown" ? "Cooldown" : globalSub === "delay" ? "Delay" : "Max consecutive";
-                    const unit = globalSub === "max" ? "" : "ms";
-                    await sendMessage(sessionID, `Global config: ${label} set to ${value}${unit}. Written to ${CONFIG_FILE}.`);
-                    throw new Error("__AUTO_CONTINUE_HANDLED__");
-                }
-                // Global help (no recognized subcommand)
-                const text = [
-                    "Usage: /auto-continue global <subcommand>",
-                    "",
-                    "  on|off          Enable/disable globally",
-                    "  cooldown <ms>   Set global cooldown",
-                    "  delay <ms>      Set global delay",
-                    "  max <n>         Set global max retries",
-                    "  update          Clear cache to fetch latest version",
-                ].join("\n");
-                await sendMessage(sessionID, text);
-                throw new Error("__AUTO_CONTINUE_HANDLED__");
-            }
-            // ── Unknown ──
-            await sendMessage(sessionID, `❌ Unknown: /auto-continue ${args.join(" ")}\nType /auto-continue help for available commands.`);
+            // Global help (no recognized subcommand)
+            const text = [
+                "Usage: /auto-continue global <subcommand>",
+                "",
+                "  on|off          Enable/disable globally",
+                "  cooldown <ms>   Set global cooldown",
+                "  delay <ms>      Set global delay",
+                "  max <n>         Set global max retries",
+                "  update          Clear cache to fetch latest version",
+            ].join("\n");
+            await sendMessage(sessionID, text);
             throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+        // ── Unknown ──
+        await sendMessage(sessionID, `❌ Unknown: /auto-continue ${args.join(" ")}\nType /auto-continue help for available commands.`);
+        throw new Error("__AUTO_CONTINUE_HANDLED__");
+    }
+    return {
+        // Register /auto-continue and /ac commands
+        config: async (opencodeConfig) => {
+            opencodeConfig.command ??= {};
+            opencodeConfig.command["auto-continue"] = {
+                template: "",
+                description: "Manage auto-continue settings (on/off, cooldown, delay, max, reload)",
+            };
+            opencodeConfig.command["ac"] = {
+                template: "",
+                description: "Alias for /auto-continue",
+            };
+        },
+        // Route both commands to the same handler
+        "command.execute.before": async (input, _output) => {
+            if (input.command !== "auto-continue" && input.command !== "ac")
+                return;
+            await handleCommand(input);
         },
         // React to events for auto-continue behavior
         event: async ({ event }) => {

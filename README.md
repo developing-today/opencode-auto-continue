@@ -31,7 +31,7 @@ Restart OpenCode. The plugin is automatically installed and loaded.
 
 ## Commands
 
-The plugin registers the `/auto-continue` command for managing settings at runtime.
+The plugin registers `/auto-continue` (and `/ac` as a shorthand alias) for managing settings at runtime.
 
 ### Quick Reference
 
@@ -43,6 +43,7 @@ The plugin registers the `/auto-continue` command for managing settings at runti
 | `/auto-continue delay <ms>` | Set delay before sending continue (session) |
 | `/auto-continue max <n>` | Set max consecutive retries (session) |
 | `/auto-continue status` | Show full status and config details |
+| `/auto-continue reload` | Reload global config from disk |
 | `/auto-continue reset` | Clear session overrides, revert to global |
 | `/auto-continue global on\|off` | Enable/disable globally (writes config) |
 | `/auto-continue global cooldown <ms>` | Set global cooldown (writes config) |
@@ -50,12 +51,15 @@ The plugin registers the `/auto-continue` command for managing settings at runti
 | `/auto-continue global max <n>` | Set global max retries (writes config) |
 | `/auto-continue global update` | Clear cache to fetch latest version |
 
+All commands also work with `/ac` (e.g., `/ac status`, `/ac on`, `/ac global update`).
+
 ### Session vs Global
 
 - **Session commands** (`on`, `off`, `cooldown`, `delay`, `max`) change settings for the current session only. They override global settings and are lost when the session ends.
 - **Global commands** (`global on`, `global off`, `global cooldown`, etc.) write to the config file on disk, affecting all future sessions.
-- **`/auto-continue global update`** clears the cached module so the latest version is re-fetched from the `latest` tag on next restart.
-- `/auto-continue reset` clears session overrides so the session falls back to global config.
+- **`reload`** re-reads the config file from disk into the running plugin (useful if you edited the file manually).
+- **`global update`** clears the cached module so the latest version is re-fetched from the `latest` tag on next restart.
+- **`reset`** clears session overrides so the session falls back to global config.
 
 ## Configuration (Optional)
 
