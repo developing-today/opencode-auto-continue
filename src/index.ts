@@ -435,11 +435,11 @@ const plugin: Plugin = async ({ client, directory }) => {
       "│       Auto-Continue Status               │",
       "╰──────────────────────────────────────────╯",
       "",
-      `  Version:        ${ver}`,
-      `  Enabled:        ${cfg.enabled ? "✅ yes" : "❌ no"}`,
+      `  Version:         ${ver}`,
+      `  Enabled:         ${cfg.enabled ? "✅ yes" : "❌ no"}`,
       `  Throttle:        ${cfg.throttleMs}ms`,
-      `  Delay:          ${cfg.delayMs}ms`,
-      `  Max Retries:    ${cfg.maxConsecutive === 0 ? "unlimited (0)" : cfg.maxConsecutive}`,
+      `  Delay:           ${cfg.delayMs}ms`,
+      `  Max Retries:     ${cfg.maxConsecutive === 0 ? "unlimited (0)" : cfg.maxConsecutive}`,
       `  Update throttle: ${cfg.updateThrottleMs}ms`,
     ];
 
@@ -448,14 +448,14 @@ const plugin: Plugin = async ({ client, directory }) => {
       lines.push("  ── Session Overrides ──");
       if (overrides.enabled !== undefined)
         lines.push(
-          `  Enabled:        ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`,
+          `  Enabled:         ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`,
         );
       if (overrides.throttleMs !== undefined)
         lines.push(`  Throttle:        ${overrides.throttleMs}ms  (global: ${globalConfig.throttleMs}ms)`);
       if (overrides.delayMs !== undefined)
-        lines.push(`  Delay:          ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
+        lines.push(`  Delay:           ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
       if (overrides.maxConsecutive !== undefined)
-        lines.push(`  Max Retries:    ${overrides.maxConsecutive === 0 ? "unlimited (0)" : overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive === 0 ? "unlimited (0)" : globalConfig.maxConsecutive})`);
+        lines.push(`  Max Retries:     ${overrides.maxConsecutive === 0 ? "unlimited (0)" : overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive === 0 ? "unlimited (0)" : globalConfig.maxConsecutive})`);
       if (overrides.updateThrottleMs !== undefined)
         lines.push(`  Update throttle: ${overrides.updateThrottleMs}ms  (global: ${globalConfig.updateThrottleMs}ms)`);
     }
