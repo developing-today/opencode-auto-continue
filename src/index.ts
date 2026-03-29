@@ -269,15 +269,31 @@ const plugin: Plugin = async ({ client, directory }) => {
 
   async function helpText(sessionID: string): Promise<string> {
     const cfg = getEffectiveConfig(sessionID);
+    const overrides = sessionConfigs.get(sessionID);
     const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
     const ver = await versionInfo();
-    return [
+    const lines = [
       "╭──────────────────────────────────────────╮",
       "│       Auto-Continue Commands             │",
       "╰──────────────────────────────────────────╯",
       "",
       `  Status: ${status} · ${ver}`,
       `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
+    ];
+
+    if (overrides && Object.keys(overrides).length > 0) {
+      const parts: string[] = [];
+      if (overrides.enabled !== undefined) parts.push(`enabled: ${overrides.enabled}`);
+      if (overrides.cooldownMs !== undefined) parts.push(`cooldown: ${overrides.cooldownMs}ms`);
+      if (overrides.delayMs !== undefined) parts.push(`delay: ${overrides.delayMs}ms`);
+      if (overrides.maxConsecutive !== undefined) parts.push(`max: ${overrides.maxConsecutive}`);
+      lines.push(`  Session overrides: ${parts.join(" · ")}`);
+      lines.push(
+        `  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive}`,
+      );
+    }
+
+    lines.push(
       "",
       "  /auto-continue on|off          Enable/disable (session)",
       "  /auto-continue cooldown <ms>   Set cooldown (session)",
@@ -291,7 +307,8 @@ const plugin: Plugin = async ({ client, directory }) => {
       "  /auto-continue help            Show this help",
       "",
       "  Alias: /ac (same commands, e.g. /ac status)",
-    ].join("\n");
+    );
+    return lines.join("\n");
   }
 
   async function statusText(sessionID: string): Promise<string> {
@@ -299,7 +316,7 @@ const plugin: Plugin = async ({ client, directory }) => {
     const overrides = sessionConfigs.get(sessionID);
     const state = sessions.get(sessionID);
     const ver = await versionInfo();
-    return [
+    const lines = [
       "╭──────────────────────────────────────────╮",
       "│       Auto-Continue Status               │",
       "╰──────────────────────────────────────────╯",
@@ -309,15 +326,33 @@ const plugin: Plugin = async ({ client, directory }) => {
       `  Cooldown:     ${cfg.cooldownMs}ms`,
       `  Delay:        ${cfg.delayMs}ms`,
       `  Max Retries:  ${cfg.maxConsecutive}`,
+    ];
+
+    if (overrides && Object.keys(overrides).length > 0) {
+      lines.push("");
+      lines.push("  ── Session Overrides ──");
+      if (overrides.enabled !== undefined)
+        lines.push(
+          `  Enabled:      ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`,
+        );
+      if (overrides.cooldownMs !== undefined)
+        lines.push(`  Cooldown:     ${overrides.cooldownMs}ms  (global: ${globalConfig.cooldownMs}ms)`);
+      if (overrides.delayMs !== undefined)
+        lines.push(`  Delay:        ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
+      if (overrides.maxConsecutive !== undefined)
+        lines.push(`  Max Retries:  ${overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive})`);
+    }
+
+    lines.push(
       "",
-      "  ── Session ──",
+      "  ── Session State ──",
       `  Consecutive retries: ${state?.consecutiveCount ?? 0}`,
       `  Pending continue:    ${state?.pendingContinue ? "yes" : "no"}`,
-      overrides ? `  Overrides: ${JSON.stringify(overrides)}` : "  No session overrides",
       "",
       "  ── Global Config ──",
       `  ${JSON.stringify(globalConfig)}`,
-    ].join("\n");
+    );
+    return lines.join("\n");
   }
 
   // ── Hooks ───────────────────────────────────────────────────────────────

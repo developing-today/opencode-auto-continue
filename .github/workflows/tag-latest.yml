@@ -30,24 +30,24 @@ jobs:
           git tag "${{ steps.vars.outputs.dated_tag }}" HEAD
           git push origin latest "${{ steps.vars.outputs.dated_tag }}" --force
 
-      - name: Compute content hash from tag tarball (same URL bun downloads)
+      - name: Compute content hashes
         id: hash
         run: |
-          # Must use the refs/tags/latest URL — same tarball bun fetches
-          # The root dir in the tar is "opencode-auto-continue-latest/" vs
-          # "opencode-auto-continue-<sha>/" for commit URLs, so hashes differ.
+          # Tag tarball hash (same URL bun fetches)
           TARBALL_URL="https://github.com/${{ github.repository }}/archive/refs/tags/latest.tar.gz"
-          # Retry a few times in case GitHub hasn't updated the tag tarball yet
           for i in 1 2 3 4 5; do
-            HASH=$(curl -sL "$TARBALL_URL" | openssl dgst -sha512 -binary | openssl base64 -A)
-            if [ -n "$HASH" ]; then
-              break
-            fi
+            TAG_HASH=$(curl -sL "$TARBALL_URL" | openssl dgst -sha512 -binary | openssl base64 -A)
+            if [ -n "$TAG_HASH" ]; then break; fi
             echo "Attempt $i: empty hash, retrying in 2s..."
             sleep 2
           done
-          SRI="sha512-${HASH}"
-          echo "content_hash=$SRI" >> "$GITHUB_OUTPUT"
+          TAG_SRI="sha512-${TAG_HASH}"
+          # Commit SHA tarball hash
+          SHA_URL="https://github.com/${{ github.repository }}/archive/${GITHUB_SHA}.tar.gz"
+          SHA_HASH=$(curl -sL "$SHA_URL" | openssl dgst -sha512 -binary | openssl base64 -A)
+          SHA_SRI="sha512-${SHA_HASH}"
+          echo "content_hash=$TAG_SRI" >> "$GITHUB_OUTPUT"
+          echo "commit_hash=$SHA_SRI" >> "$GITHUB_OUTPUT"
 
       - name: Create dated release (marked as latest)
         env:
@@ -57,6 +57,7 @@ jobs:
             --title "${{ steps.vars.outputs.dated_tag }}" \
             --latest \
             --notes "${{ steps.hash.outputs.content_hash }}
+          ${{ steps.hash.outputs.commit_hash }}
           
           Commit: ${{ steps.vars.outputs.sha }}
           Repository: https://github.com/${{ github.repository }}"
@@ -70,6 +71,7 @@ jobs:
           gh release create latest \
             --title "latest" \
             --notes "${{ steps.hash.outputs.content_hash }}
+          ${{ steps.hash.outputs.commit_hash }}
           
           Commit: ${{ steps.vars.outputs.sha }}
           Points to same content as ${{ steps.vars.outputs.dated_tag }}"
