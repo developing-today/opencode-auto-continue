@@ -1,6 +1,6 @@
 # opencode-auto-continue
 
-OpenCode plugin that automatically sends "continue" when bad request (HTTP 400) errors occur, allowing sessions to recover and resume without manual intervention.
+OpenCode plugin that automatically sends "continue" when bad request (HTTP 400) errors occur, allowing sessions to recover and resume without manual intervention. These errors are often transient — caused by provider rate limits, temporary API issues, or context window edge cases — and a simple retry usually succeeds.
 
 ## How It Works
 
