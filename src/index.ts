@@ -1,22 +1,101 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
 
 const PLUGIN_NAME = "opencode-auto-continue";
+const CONFIG_FILE = `${PLUGIN_NAME}.jsonc`;
 
 /**
- * Configuration constants.
- * COOLDOWN_MS: minimum time between auto-continues for the same session (prevents infinite loops)
- * DELAY_MS: delay after session.idle before sending continue (lets things settle)
- * MAX_CONSECUTIVE: max consecutive auto-continues per session before giving up
+ * Default configuration values.
  */
-const COOLDOWN_MS = 5_000;
-const DELAY_MS = 2_000;
-const MAX_CONSECUTIVE = 5;
+const DEFAULTS = {
+  /** Minimum ms between auto-continues for the same session (prevents infinite loops) */
+  cooldownMs: 5_000,
+  /** Delay after session.idle before sending continue (lets things settle) */
+  delayMs: 2_000,
+  /** Max consecutive auto-continues per session before giving up */
+  maxConsecutive: 5,
+  /** Whether the plugin is enabled */
+  enabled: true,
+} as const;
+
+interface Config {
+  cooldownMs: number;
+  delayMs: number;
+  maxConsecutive: number;
+  enabled: boolean;
+}
 
 interface SessionState {
   lastErrorTime: number;
   lastContinueTime: number;
   pendingContinue: boolean;
   consecutiveCount: number;
+}
+
+function stripJsoncComments(text: string): string {
+  let result = "";
+  let inString = false;
+  let stringChar = "";
+  let i = 0;
+  while (i < text.length) {
+    if (inString) {
+      if (text[i] === "\\" && i + 1 < text.length) {
+        result += text[i] + text[i + 1];
+        i += 2;
+        continue;
+      }
+      if (text[i] === stringChar) {
+        inString = false;
+      }
+      result += text[i];
+      i++;
+    } else {
+      if (text[i] === '"' || text[i] === "'") {
+        inString = true;
+        stringChar = text[i];
+        result += text[i];
+        i++;
+      } else if (text[i] === "/" && i + 1 < text.length && text[i + 1] === "/") {
+        // Single-line comment — skip to end of line
+        while (i < text.length && text[i] !== "\n") i++;
+      } else if (text[i] === "/" && i + 1 < text.length && text[i + 1] === "*") {
+        // Block comment — skip to */
+        i += 2;
+        while (i < text.length && !(text[i] === "*" && i + 1 < text.length && text[i + 1] === "/")) i++;
+        i += 2;
+      } else {
+        result += text[i];
+        i++;
+      }
+    }
+  }
+  return result;
+}
+
+async function loadConfig(directory: string, log: (msg: string) => void): Promise<Config> {
+  const configPath = join(directory, CONFIG_FILE);
+  try {
+    const raw = await readFile(configPath, "utf-8");
+    const parsed = JSON.parse(stripJsoncComments(raw));
+    const config: Config = { ...DEFAULTS };
+
+    if (typeof parsed.cooldownMs === "number") config.cooldownMs = parsed.cooldownMs;
+    if (typeof parsed.delayMs === "number") config.delayMs = parsed.delayMs;
+    if (typeof parsed.maxConsecutive === "number") config.maxConsecutive = parsed.maxConsecutive;
+    if (typeof parsed.enabled === "boolean") config.enabled = parsed.enabled;
+
+    log(`Loaded config from ${configPath}: ${JSON.stringify(config)}`);
+    return config;
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") {
+      log(`No config file at ${configPath}, using defaults`);
+    } else {
+      log(`Error reading config from ${configPath}: ${err} — using defaults`);
+    }
+    return { ...DEFAULTS };
+  }
 }
 
 function isBadRequestError(error: unknown): boolean {
@@ -50,11 +129,18 @@ function errorMessage(error: unknown): string {
   );
 }
 
-const plugin: Plugin = async ({ client }) => {
+const plugin: Plugin = async ({ client, directory }) => {
   const sessions = new Map<string, SessionState>();
 
   function log(msg: string) {
     console.log(`[${PLUGIN_NAME}] ${msg}`);
+  }
+
+  const config = await loadConfig(directory, log);
+
+  if (!config.enabled) {
+    log("Plugin disabled via config");
+    return {};
   }
 
   function getState(sessionID: string): SessionState {
@@ -76,13 +162,13 @@ const plugin: Plugin = async ({ client }) => {
     if (!state?.pendingContinue) return;
 
     const now = Date.now();
-    if (now - state.lastContinueTime < COOLDOWN_MS) {
+    if (now - state.lastContinueTime < config.cooldownMs) {
       log(`Cooldown active for session ${sessionID}, skipping`);
       return;
     }
 
-    if (state.consecutiveCount >= MAX_CONSECUTIVE) {
-      log(`Max consecutive auto-continues (${MAX_CONSECUTIVE}) reached for session ${sessionID}, giving up`);
+    if (state.consecutiveCount >= config.maxConsecutive) {
+      log(`Max consecutive auto-continues (${config.maxConsecutive}) reached for session ${sessionID}, giving up`);
       state.pendingContinue = false;
       return;
     }
@@ -91,7 +177,7 @@ const plugin: Plugin = async ({ client }) => {
     state.consecutiveCount++;
     state.pendingContinue = false;
 
-    log(`Sending "continue" to session ${sessionID} (attempt ${state.consecutiveCount}/${MAX_CONSECUTIVE})`);
+    log(`Sending "continue" to session ${sessionID} (attempt ${state.consecutiveCount}/${config.maxConsecutive})`);
 
     try {
       await client.session.promptAsync({
@@ -151,13 +237,12 @@ const plugin: Plugin = async ({ client }) => {
 
         const state = sessions.get(sessionID);
         if (state?.pendingContinue) {
-          log(`Session ${sessionID} is idle with pending continue, waiting ${DELAY_MS}ms...`);
-          setTimeout(() => sendContinue(sessionID), DELAY_MS);
+          log(`Session ${sessionID} is idle with pending continue, waiting ${config.delayMs}ms...`);
+          setTimeout(() => sendContinue(sessionID), config.delayMs);
         }
       }
 
       // ── Reset consecutive counter on successful completion ──
-      // When a message completes without error, reset the counter
       if (event.type === "message.updated") {
         const props = event.properties as {
           info?: {
