@@ -519,6 +519,10 @@ const plugin = async ({ client, directory }) => {
                     const commitSha = commitLine?.replace("Commit: ", "").trim();
                     const shortSha = commitSha?.substring(0, 7) ?? "unknown";
                     const remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
+                    // Update the shared debounce cache so versionInfo doesn't show stale data
+                    cachedRemoteHash = remoteHash;
+                    cachedCommitSha = commitSha ?? null;
+                    lastRemoteCheck = Date.now();
                     // Compare with currently loaded hash
                     const currentShort = loadedHash ? shortHash(loadedHash) : "unknown";
                     const isUpToDate = loadedHash && remoteHash && loadedHash === remoteHash;
