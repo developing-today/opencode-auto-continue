@@ -104,7 +104,7 @@ function parseJsonc(text: string): unknown {
 }
 
 async function loadConfig(directory: string, log: (msg: string) => void): Promise<Config> {
-  const configPath = join(directory, CONFIG_FILE);
+  const configPath = join(directory, ".opencode", CONFIG_FILE);
   try {
     const raw = await readFile(configPath, "utf-8");
     const parsed = parseJsonc(raw) as Record<string, unknown>;
@@ -208,7 +208,7 @@ const plugin: Plugin = async ({ client, directory }) => {
 
   // Write current globalConfig to disk
   async function writeGlobalConfig() {
-    const configPath = join(directory, CONFIG_FILE);
+    const configPath = join(directory, ".opencode", CONFIG_FILE);
     const content = JSON.stringify(globalConfig, null, 2) + "\n";
     await writeFile(configPath, content, "utf-8");
     log(`Wrote global config to ${configPath}`);
@@ -415,7 +415,7 @@ const plugin: Plugin = async ({ client, directory }) => {
 
     // ── Reload (re-read global config from disk) ──
     if (subcmd === "reload") {
-      const configPath = join(directory, CONFIG_FILE);
+      const configPath = join(directory, ".opencode", CONFIG_FILE);
       let fileExists = false;
       try {
         await access(configPath);
