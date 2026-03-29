@@ -342,11 +342,16 @@ const plugin: Plugin = async ({ client, directory }) => {
     if (overrides.delayMs !== undefined) parts.push(`delay: ${overrides.delayMs}ms`);
     if (overrides.maxConsecutive !== undefined) parts.push(`max: ${overrides.maxConsecutive}`);
     if (overrides.checkIntervalMs !== undefined) parts.push(`check-interval: ${overrides.checkIntervalMs}ms`);
-    return [
-      "",
-      `  Session overrides: ${parts.join(" · ")}`,
-      `  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive} · check-interval: ${globalConfig.checkIntervalMs}ms`,
+    const globalParts = [
+      `enabled: ${globalConfig.enabled}`,
+      `cooldown: ${globalConfig.cooldownMs}ms`,
+      `delay: ${globalConfig.delayMs}ms`,
+      `max: ${globalConfig.maxConsecutive}`,
     ];
+    if (globalConfig.checkIntervalMs !== DEFAULTS.checkIntervalMs) {
+      globalParts.push(`check-interval: ${globalConfig.checkIntervalMs}ms`);
+    }
+    return ["", `  Session overrides: ${parts.join(" · ")}`, `  Global defaults:   ${globalParts.join(" · ")}`];
   }
 
   async function configSummaryLines(sessionID: string, checkRemote = false): Promise<string[]> {
@@ -354,10 +359,11 @@ const plugin: Plugin = async ({ client, directory }) => {
     const overrides = sessionConfigs.get(sessionID);
     const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
     const ver = await versionInfo(checkRemote);
-    const lines = [
-      `  Status: ${status} · ${ver}`,
-      `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
-    ];
+    const summaryParts = [`Cooldown: ${cfg.cooldownMs}ms`, `Delay: ${cfg.delayMs}ms`, `Max: ${cfg.maxConsecutive}`];
+    if (cfg.checkIntervalMs !== DEFAULTS.checkIntervalMs) {
+      summaryParts.push(`Check: ${cfg.checkIntervalMs}ms`);
+    }
+    const lines = [`  Status: ${status} · ${ver}`, `  ${summaryParts.join(" · ")}`];
     if (overrides && Object.keys(overrides).length > 0) {
       lines.push(...overrideLines(overrides));
     }
@@ -407,8 +413,10 @@ const plugin: Plugin = async ({ client, directory }) => {
       `  Cooldown:       ${cfg.cooldownMs}ms`,
       `  Delay:          ${cfg.delayMs}ms`,
       `  Max Retries:    ${cfg.maxConsecutive}`,
-      `  Check Interval: ${cfg.checkIntervalMs}ms`,
     ];
+    if (cfg.checkIntervalMs !== DEFAULTS.checkIntervalMs) {
+      lines.push(`  Check Interval: ${cfg.checkIntervalMs}ms`);
+    }
 
     if (overrides && Object.keys(overrides).length > 0) {
       lines.push("");
