@@ -1,4 +1,4 @@
-import { access, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_DIR = ".opencode";
@@ -145,8 +145,9 @@ function errorMessage(error) {
 const plugin = async ({ client, directory }) => {
     const sessions = new Map();
     const sessionConfigs = new Map();
-    function log(msg) {
-        console.log(`[${PLUGIN_NAME}] ${msg}`);
+    // Silent log — console.log leaks into the TUI as raw terminal output
+    function log(_msg) {
+        // intentionally silent
     }
     // Global config — loaded from file, mutated by /auto-continue global commands
     const globalConfig = await loadConfig(directory, log);
@@ -252,22 +253,28 @@ const plugin = async ({ client, directory }) => {
             `  Global defaults:   enabled: ${globalConfig.enabled} · cooldown: ${globalConfig.cooldownMs}ms · delay: ${globalConfig.delayMs}ms · max: ${globalConfig.maxConsecutive}`,
         ];
     }
-    async function helpText(sessionID) {
+    async function configSummaryLines(sessionID) {
         const cfg = getEffectiveConfig(sessionID);
         const overrides = sessionConfigs.get(sessionID);
         const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
         const ver = await versionInfo();
         const lines = [
-            "╭──────────────────────────────────────────╮",
-            "│       Auto-Continue Commands             │",
-            "╰──────────────────────────────────────────╯",
-            "",
             `  Status: ${status} · ${ver}`,
             `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
         ];
         if (overrides && Object.keys(overrides).length > 0) {
             lines.push(...overrideLines(overrides));
         }
+        return lines;
+    }
+    async function helpText(sessionID) {
+        const lines = [
+            "╭──────────────────────────────────────────╮",
+            "│       Auto-Continue Commands             │",
+            "╰──────────────────────────────────────────╯",
+            "",
+            ...(await configSummaryLines(sessionID)),
+        ];
         lines.push("", "  /auto-continue on|off          Enable/disable (session)", "  /auto-continue cooldown <ms>   Set cooldown (session)", "  /auto-continue delay <ms>      Set delay (session)", "  /auto-continue max <n>         Set max retries (session)", "  /auto-continue status          Show current settings", "  /auto-continue reset           Clear session overrides", "  /auto-continue reload           Reload global config from disk", "  /auto-continue global <cmd>    Persist setting to config file", "  /auto-continue global update   Clear cache to fetch latest version", "  /auto-continue help            Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
         return lines.join("\n");
     }
@@ -351,8 +358,9 @@ const plugin = async ({ client, directory }) => {
         if (subcmd === "reload") {
             const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
             let fileExists = false;
+            let rawContents = "";
             try {
-                await access(configPath);
+                rawContents = await readFile(configPath, "utf-8");
                 fileExists = true;
             }
             catch {
@@ -360,22 +368,15 @@ const plugin = async ({ client, directory }) => {
             }
             const reloaded = await loadConfig(directory, log);
             Object.assign(globalConfig, reloaded);
+            const lines = [];
             if (fileExists) {
-                await sendMessage(sessionID, `Global config reloaded from ${CONFIG_FILE}.`);
+                lines.push("Auto-continue global config reloaded", `  From: ${configPath}`, `  Contents: ${rawContents.trim()}`);
             }
             else {
-                await sendMessage(sessionID, `No ${CONFIG_FILE} found — using defaults.`);
+                lines.push("Auto-continue global config reloaded", `  No ${CONFIG_FILE} found at ${configPath} — using defaults`);
             }
-            // Dismiss the overlay by sending blank messages after a delay
-            setTimeout(async () => {
-                try {
-                    await sendMessage(sessionID, "\u200B");
-                    await sendMessage(sessionID, "\u200B");
-                }
-                catch {
-                    // Best effort
-                }
-            }, 2000);
+            lines.push("", ...(await configSummaryLines(sessionID)));
+            await sendMessage(sessionID, lines.join("\n"));
             throw new Error("__AUTO_CONTINUE_HANDLED__");
         }
         // ── Reset (clear session overrides) ──

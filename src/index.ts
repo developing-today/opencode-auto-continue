@@ -1,4 +1,4 @@
-import { access, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
 
@@ -164,8 +164,9 @@ const plugin: Plugin = async ({ client, directory }) => {
   const sessions = new Map<string, SessionState>();
   const sessionConfigs = new Map<string, Partial<Config>>();
 
-  function log(msg: string) {
-    console.log(`[${PLUGIN_NAME}] ${msg}`);
+  // Silent log — console.log leaks into the TUI as raw terminal output
+  function log(_msg: string) {
+    // intentionally silent
   }
 
   // Global config — loaded from file, mutated by /auto-continue global commands
@@ -281,23 +282,29 @@ const plugin: Plugin = async ({ client, directory }) => {
     ];
   }
 
-  async function helpText(sessionID: string): Promise<string> {
+  async function configSummaryLines(sessionID: string): Promise<string[]> {
     const cfg = getEffectiveConfig(sessionID);
     const overrides = sessionConfigs.get(sessionID);
     const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
     const ver = await versionInfo();
     const lines = [
+      `  Status: ${status} · ${ver}`,
+      `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
+    ];
+    if (overrides && Object.keys(overrides).length > 0) {
+      lines.push(...overrideLines(overrides));
+    }
+    return lines;
+  }
+
+  async function helpText(sessionID: string): Promise<string> {
+    const lines = [
       "╭──────────────────────────────────────────╮",
       "│       Auto-Continue Commands             │",
       "╰──────────────────────────────────────────╯",
       "",
-      `  Status: ${status} · ${ver}`,
-      `  Cooldown: ${cfg.cooldownMs}ms · Delay: ${cfg.delayMs}ms · Max: ${cfg.maxConsecutive}`,
+      ...(await configSummaryLines(sessionID)),
     ];
-
-    if (overrides && Object.keys(overrides).length > 0) {
-      lines.push(...overrideLines(overrides));
-    }
 
     lines.push(
       "",
@@ -418,8 +425,9 @@ const plugin: Plugin = async ({ client, directory }) => {
     if (subcmd === "reload") {
       const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
       let fileExists = false;
+      let rawContents = "";
       try {
-        await access(configPath);
+        rawContents = await readFile(configPath, "utf-8");
         fileExists = true;
       } catch {
         // File doesn't exist
@@ -428,21 +436,23 @@ const plugin: Plugin = async ({ client, directory }) => {
       const reloaded = await loadConfig(directory, log);
       Object.assign(globalConfig, reloaded);
 
+      const lines: string[] = [];
       if (fileExists) {
-        await sendMessage(sessionID, `Global config reloaded from ${CONFIG_FILE}.`);
+        lines.push(
+          "Auto-continue global config reloaded",
+          `  From: ${configPath}`,
+          `  Contents: ${rawContents.trim()}`,
+        );
       } else {
-        await sendMessage(sessionID, `No ${CONFIG_FILE} found — using defaults.`);
+        lines.push(
+          "Auto-continue global config reloaded",
+          `  No ${CONFIG_FILE} found at ${configPath} — using defaults`,
+        );
       }
 
-      // Dismiss the overlay by sending blank messages after a delay
-      setTimeout(async () => {
-        try {
-          await sendMessage(sessionID, "\u200B");
-          await sendMessage(sessionID, "\u200B");
-        } catch {
-          // Best effort
-        }
-      }, 2000);
+      lines.push("", ...(await configSummaryLines(sessionID)));
+
+      await sendMessage(sessionID, lines.join("\n"));
 
       throw new Error("__AUTO_CONTINUE_HANDLED__");
     }
