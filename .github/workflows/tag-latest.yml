@@ -12,8 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Force-update latest tags
+      - name: Force-update latest tag
         run: |
           git tag -f latest HEAD
-          git tag -f "@latest" HEAD
-          git push origin latest "@latest" --force
+          git push origin latest --force
