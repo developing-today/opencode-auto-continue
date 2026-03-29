@@ -44,11 +44,13 @@ The plugin registers the `/auto-continue` command for managing settings at runti
 | `/auto-continue global cooldown <ms>` | Set global cooldown (writes config) |
 | `/auto-continue global delay <ms>` | Set global delay (writes config) |
 | `/auto-continue global max <n>` | Set global max retries (writes config) |
+| `/auto-continue global update` | Update plugin to latest version |
 
 ### Session vs Global
 
 - **Session commands** (`on`, `off`, `cooldown`, `delay`, `max`) change settings for the current session only. They override global settings and are lost when the session ends.
 - **Global commands** (`global on`, `global off`, `global cooldown`, etc.) write to the config file on disk, affecting all future sessions.
+- **`/auto-continue global update`** fetches the latest commit from GitHub, pins it in `opencode.jsonc`, and clears the bun cache. Restart OpenCode to load the new version.
 - `/auto-continue reset` clears session overrides so the session falls back to global config.
 
 ## Configuration (Optional)

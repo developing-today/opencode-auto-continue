@@ -1,9 +1,11 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
 
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_FILE = `${PLUGIN_NAME}.jsonc`;
+const GITHUB_REPO = "developing-today/opencode-auto-continue";
+const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/commits/main`;
 
 /**
  * Default configuration values.
@@ -238,6 +240,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       "  /auto-continue status          Show current settings",
       "  /auto-continue reset           Clear session overrides",
       "  /auto-continue global <cmd>    Persist setting to config file",
+      "  /auto-continue global update   Update plugin to latest version",
       "  /auto-continue help            Show this help",
     ].join("\n");
   }
@@ -342,6 +345,89 @@ const plugin: Plugin = async ({ client, directory }) => {
       if (subcmd === "global") {
         const globalSub = args[1]?.toLowerCase() || "";
 
+        // ── Global Update: fetch latest commit, update opencode.jsonc, clear cache ──
+        if (globalSub === "update") {
+          try {
+            await sendMessage(sessionID, "Checking for updates...");
+
+            // 1. Fetch latest commit SHA from GitHub API
+            const response = await fetch(GITHUB_API_URL, {
+              headers: { "User-Agent": PLUGIN_NAME },
+            });
+            if (!response.ok) {
+              await sendMessage(sessionID, `❌ GitHub API returned ${response.status}: ${response.statusText}`);
+              throw new Error("__AUTO_CONTINUE_HANDLED__");
+            }
+            const data = (await response.json()) as { sha?: string };
+            const latestSha = data.sha;
+            if (!latestSha || latestSha.length < 7) {
+              await sendMessage(sessionID, "❌ Failed to parse commit SHA from GitHub response.");
+              throw new Error("__AUTO_CONTINUE_HANDLED__");
+            }
+            const shortSha = latestSha.substring(0, 7);
+
+            // 2. Read opencode.jsonc
+            const opencodeConfigPath = join(directory, "opencode.jsonc");
+            let configContent: string;
+            try {
+              configContent = await readFile(opencodeConfigPath, "utf-8");
+            } catch {
+              await sendMessage(sessionID, `❌ Could not read ${opencodeConfigPath}`);
+              throw new Error("__AUTO_CONTINUE_HANDLED__");
+            }
+
+            // 3. Find and replace the plugin reference (handles with or without existing #sha)
+            const pluginPattern = new RegExp(`("github:${GITHUB_REPO.replace("/", "\\/")})(#[^"]*)?(")`);
+            if (!pluginPattern.test(configContent)) {
+              await sendMessage(sessionID, `❌ Could not find "github:${GITHUB_REPO}" in ${opencodeConfigPath}`);
+              throw new Error("__AUTO_CONTINUE_HANDLED__");
+            }
+
+            // Check if already on this commit
+            const currentMatch = configContent.match(pluginPattern);
+            const currentRef = currentMatch?.[2] || "";
+            if (currentRef === `#${latestSha}`) {
+              await sendMessage(sessionID, `Already up to date (${shortSha}).`);
+              throw new Error("__AUTO_CONTINUE_HANDLED__");
+            }
+
+            // 4. Update the reference
+            const newContent = configContent.replace(pluginPattern, `$1#${latestSha}$3`);
+            await writeFile(opencodeConfigPath, newContent, "utf-8");
+            log(`Updated opencode.jsonc: github:${GITHUB_REPO}#${latestSha}`);
+
+            // 5. Clear bun cache
+            let cacheCleared = false;
+            try {
+              const home = process.env.HOME || process.env.USERPROFILE || "";
+              const cacheDir = join(home, ".cache", ".bun", "install", "cache");
+              const entries = await readdir(cacheDir);
+              for (const entry of entries) {
+                if (entry.includes("developing-today-opencode-auto-continue") || entry === "opencode-auto-continue") {
+                  await rm(join(cacheDir, entry), { recursive: true, force: true });
+                  cacheCleared = true;
+                }
+              }
+            } catch {
+              // Cache dir might not exist or be in a different location — not critical
+            }
+
+            const lines = [
+              `✅ Updated to latest commit: ${shortSha}`,
+              `   Ref: github:${GITHUB_REPO}#${latestSha}`,
+              currentRef ? `   Was: github:${GITHUB_REPO}${currentRef}` : `   Was: github:${GITHUB_REPO} (unpinned)`,
+              cacheCleared ? "   Bun cache cleared." : "   ⚠️  Could not clear bun cache (clear manually if needed).",
+              "",
+              "   Restart OpenCode to load the new version.",
+            ];
+            await sendMessage(sessionID, lines.join("\n"));
+          } catch (err: unknown) {
+            if (err instanceof Error && err.message === "__AUTO_CONTINUE_HANDLED__") throw err;
+            await sendMessage(sessionID, `❌ Update failed: ${err}`);
+          }
+          throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+
         if (globalSub === "on" || globalSub === "off") {
           globalConfig.enabled = globalSub === "on";
           await writeGlobalConfig();
@@ -381,6 +467,7 @@ const plugin: Plugin = async ({ client, directory }) => {
           "  cooldown <ms>   Set global cooldown",
           "  delay <ms>      Set global delay",
           "  max <n>         Set global max retries",
+          "  update          Update plugin to latest version",
         ].join("\n");
         await sendMessage(sessionID, text);
         throw new Error("__AUTO_CONTINUE_HANDLED__");
