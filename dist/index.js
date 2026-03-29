@@ -214,7 +214,7 @@ const plugin = async ({ client, directory }) => {
             "  /auto-continue status          Show current settings",
             "  /auto-continue reset           Clear session overrides",
             "  /auto-continue global <cmd>    Persist setting to config file",
-            "  /auto-continue global update   Update plugin to latest version",
+            "  /auto-continue global update   Clear cache to fetch latest version",
             "  /auto-continue help            Show this help",
         ].join("\n");
     }
@@ -306,7 +306,7 @@ const plugin = async ({ client, directory }) => {
             // ── Global ──
             if (subcmd === "global") {
                 const globalSub = args[1]?.toLowerCase() || "";
-                // ── Global Update: fetch latest commit, update opencode.jsonc, clear cache ──
+                // ── Global Update: clear cached module so next restart fetches latest ──
                 if (globalSub === "update") {
                     try {
                         await sendMessage(sessionID, "Checking for updates...");
@@ -325,54 +325,56 @@ const plugin = async ({ client, directory }) => {
                             throw new Error("__AUTO_CONTINUE_HANDLED__");
                         }
                         const shortSha = latestSha.substring(0, 7);
-                        // 2. Read opencode.jsonc
-                        const opencodeConfigPath = join(directory, "opencode.jsonc");
-                        let configContent;
+                        // 2. Clear OpenCode's cached module and dependency entry so it re-installs on restart
+                        const home = process.env.HOME || process.env.USERPROFILE || "";
+                        const opencodeCacheDir = join(home, ".cache", "opencode");
+                        let cacheCleared = false;
+                        // Remove the cached node_modules entry
                         try {
-                            configContent = await readFile(opencodeConfigPath, "utf-8");
+                            const cachedMod = join(opencodeCacheDir, "node_modules", PLUGIN_NAME);
+                            await rm(cachedMod, { recursive: true, force: true });
+                            cacheCleared = true;
                         }
                         catch {
-                            await sendMessage(sessionID, `❌ Could not read ${opencodeConfigPath}`);
-                            throw new Error("__AUTO_CONTINUE_HANDLED__");
+                            // Not critical if missing
                         }
-                        // 3. Find and replace the plugin reference (handles with or without existing #sha)
-                        const pluginPattern = new RegExp(`("github:${GITHUB_REPO.replace("/", "\\/")})(#[^"]*)?(")`);
-                        if (!pluginPattern.test(configContent)) {
-                            await sendMessage(sessionID, `❌ Could not find "github:${GITHUB_REPO}" in ${opencodeConfigPath}`);
-                            throw new Error("__AUTO_CONTINUE_HANDLED__");
-                        }
-                        // Check if already on this commit
-                        const currentMatch = configContent.match(pluginPattern);
-                        const currentRef = currentMatch?.[2] || "";
-                        if (currentRef === `#${latestSha}`) {
-                            await sendMessage(sessionID, `Already up to date (${shortSha}).`);
-                            throw new Error("__AUTO_CONTINUE_HANDLED__");
-                        }
-                        // 4. Update the reference
-                        const newContent = configContent.replace(pluginPattern, `$1#${latestSha}$3`);
-                        await writeFile(opencodeConfigPath, newContent, "utf-8");
-                        log(`Updated opencode.jsonc: github:${GITHUB_REPO}#${latestSha}`);
-                        // 5. Clear bun cache
-                        let cacheCleared = false;
+                        // Remove from OpenCode's cache package.json so it triggers reinstall
                         try {
-                            const home = process.env.HOME || process.env.USERPROFILE || "";
-                            const cacheDir = join(home, ".cache", ".bun", "install", "cache");
-                            const entries = await readdir(cacheDir);
+                            const pkgJsonPath = join(opencodeCacheDir, "package.json");
+                            const raw = await readFile(pkgJsonPath, "utf-8");
+                            const parsed = JSON.parse(raw);
+                            if (parsed.dependencies?.[PLUGIN_NAME]) {
+                                delete parsed.dependencies[PLUGIN_NAME];
+                                await writeFile(pkgJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
+                            }
+                        }
+                        catch {
+                            // Not critical
+                        }
+                        // Remove bun.lock to avoid stale resolution
+                        try {
+                            await rm(join(opencodeCacheDir, "bun.lock"), { force: true });
+                        }
+                        catch {
+                            // Not critical
+                        }
+                        // Also clear bun's own install cache
+                        try {
+                            const bunCacheDir = join(home, ".cache", ".bun", "install", "cache");
+                            const entries = await readdir(bunCacheDir);
                             for (const entry of entries) {
-                                if (entry.includes("developing-today-opencode-auto-continue") || entry === "opencode-auto-continue") {
-                                    await rm(join(cacheDir, entry), { recursive: true, force: true });
-                                    cacheCleared = true;
+                                if (entry.includes("developing-today-opencode-auto-continue") || entry === PLUGIN_NAME) {
+                                    await rm(join(bunCacheDir, entry), { recursive: true, force: true });
                                 }
                             }
                         }
                         catch {
-                            // Cache dir might not exist or be in a different location — not critical
+                            // Cache dir might not exist — not critical
                         }
                         const lines = [
-                            `✅ Updated to latest commit: ${shortSha}`,
-                            `   Ref: github:${GITHUB_REPO}#${latestSha}`,
-                            currentRef ? `   Was: github:${GITHUB_REPO}${currentRef}` : `   Was: github:${GITHUB_REPO} (unpinned)`,
-                            cacheCleared ? "   Bun cache cleared." : "   ⚠️  Could not clear bun cache (clear manually if needed).",
+                            `✅ Cache cleared. Latest commit on main: ${shortSha}`,
+                            cacheCleared ? "   Removed cached module." : "   No cached module found.",
+                            "   The 'latest' tag tarball will be re-fetched on next restart.",
                             "",
                             "   Restart OpenCode to load the new version.",
                         ];
@@ -417,7 +419,7 @@ const plugin = async ({ client, directory }) => {
                     "  cooldown <ms>   Set global cooldown",
                     "  delay <ms>      Set global delay",
                     "  max <n>         Set global max retries",
-                    "  update          Update plugin to latest version",
+                    "  update          Clear cache to fetch latest version",
                 ].join("\n");
                 await sendMessage(sessionID, text);
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
