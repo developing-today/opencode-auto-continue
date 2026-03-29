@@ -1,4 +1,4 @@
-import { readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_DIR = ".opencode";
@@ -162,7 +162,18 @@ const plugin = async ({ client, directory }) => {
     let lastRemoteCheck = 0;
     let cachedRemoteHash = null;
     let cachedCommitSha = null;
-    let cacheAlreadyCleared = false;
+    /** Check whether the cached module has been cleared (by global update in any session) */
+    async function isCacheCleared() {
+        try {
+            const home = process.env.HOME || process.env.USERPROFILE || "";
+            const cachedMod = join(home, ".cache", "opencode", "node_modules", PLUGIN_NAME);
+            await access(cachedMod);
+            return false; // exists → not cleared
+        }
+        catch {
+            return true; // doesn't exist → cleared
+        }
+    }
     async function fetchLatestHash() {
         const cfg = globalConfig;
         const now = Date.now();
@@ -209,12 +220,13 @@ const plugin = async ({ client, directory }) => {
             if (remoteHash && remoteShort) {
                 const matchesLoaded = loadedHash === remoteHash;
                 const matchesCurrent = currentHash === remoteHash;
+                const cacheCleared = await isCacheCleared();
                 if (matchesLoaded && matchesCurrent) {
                     // All same — nothing to add
                 }
                 else if (!localUpdated && !matchesLoaded) {
                     // loaded == current, remote is different → update available
-                    if (cacheAlreadyCleared) {
+                    if (cacheCleared) {
                         lines.push(`  🆕 Update ready: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
                         lines.push(`     Restart opencode to load the new version`);
                     }
@@ -228,7 +240,7 @@ const plugin = async ({ client, directory }) => {
                 }
                 else if (localUpdated && !matchesCurrent && !matchesLoaded) {
                     // All three differ: loaded ≠ current ≠ remote
-                    if (cacheAlreadyCleared) {
+                    if (cacheCleared) {
                         lines.push(`  🆕 Newer version available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
                         lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
                         lines.push(`     Restart opencode to load the new version`);
@@ -567,7 +579,6 @@ const plugin = async ({ client, directory }) => {
                         "",
                         "   Restart opencode to load the new version.",
                     ];
-                    cacheAlreadyCleared = true;
                     await sendMessage(sessionID, msg.join("\n"));
                 }
                 catch (err) {
