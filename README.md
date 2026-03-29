@@ -7,7 +7,7 @@ OpenCode plugin that automatically sends "continue" when bad request (HTTP 400) 
 1. **Detects errors**: Listens for `session.error` and `message.updated` events
 2. **Identifies bad requests**: Checks for `ApiError` with status code 400 or messages containing "bad request"
 3. **Waits for idle**: When the session becomes idle after an error, sends "continue" via `promptAsync`
-4. **Safety limits**: Configurable cooldown and max consecutive retries prevent infinite loops
+4. **Safety limits**: Configurable throttle and max consecutive retries prevent infinite loops
 5. **Auto-reset**: Consecutive retry counter resets when a message completes successfully
 
 ## Installation
@@ -39,26 +39,26 @@ The plugin registers `/auto-continue` (and `/ac` as a shorthand alias) for manag
 |---------|-------------|
 | `/auto-continue` | Show help menu with current status and version check |
 | `/auto-continue on\|off` | Enable/disable for current session |
-| `/auto-continue cooldown <ms>` | Set cooldown between retries (session) |
+| `/auto-continue throttle <ms>` | Set retry throttle (session) |
 | `/auto-continue delay <ms>` | Set delay before sending continue (session) |
 | `/auto-continue max <n>` | Set max consecutive retries (session) |
-| `/auto-continue check-interval <ms>` | Set version check debounce (session) |
+| `/auto-continue update-throttle <ms>` | Set update throttle (session) |
 | `/auto-continue status` | Show full status, config details, and version check |
 | `/auto-continue reload` | Reload global config from disk |
 | `/auto-continue reset` | Clear session overrides, revert to global |
 | `/auto-continue global on\|off` | Enable/disable globally (writes config) |
-| `/auto-continue global cooldown <ms>` | Set global cooldown (writes config) |
+| `/auto-continue global throttle <ms>` | Set global retry throttle (writes config) |
 | `/auto-continue global delay <ms>` | Set global delay (writes config) |
 | `/auto-continue global max <n>` | Set global max retries (writes config) |
-| `/auto-continue global check-interval <ms>` | Set global version check debounce (writes config) |
+| `/auto-continue global update-throttle <ms>` | Set global update throttle (writes config) |
 | `/auto-continue global update` | Clear cache to fetch latest version |
 
 All commands also work with `/ac` (e.g., `/ac status`, `/ac on`, `/ac global update`).
 
 ### Session vs Global
 
-- **Session commands** (`on`, `off`, `cooldown`, `delay`, `max`, `check-interval`) change settings for the current session only. They override global settings and are lost when the session ends.
-- **Global commands** (`global on`, `global off`, `global cooldown`, `global check-interval`, etc.) write to the config file on disk, affecting all future sessions.
+- **Session commands** (`on`, `off`, `throttle`, `delay`, `max`, `update-throttle`) change settings for the current session only. They override global settings and are lost when the session ends.
+- **Global commands** (`global on`, `global off`, `global throttle`, `global update-throttle`, etc.) write to the config file on disk, affecting all future sessions.
 - **`reload`** re-reads the config file from disk into the running plugin (useful if you edited the file manually).
 - **`global update`** clears the cached module so the latest version is re-fetched from the `latest` tag on next restart.
 - **`reset`** clears session overrides so the session falls back to global config.
@@ -71,8 +71,8 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
 
 ```jsonc
 {
-  // Minimum ms between auto-continues for the same session
-  "cooldownMs": 5000,
+  // Retry throttle: minimum ms between auto-continues for the same session
+  "throttleMs": 5000,
 
   // Delay after session becomes idle before sending continue
   "delayMs": 2000,
@@ -83,20 +83,20 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
   // Set to false to disable the plugin without removing it
   "enabled": true,
 
-  // Minimum ms between remote version checks (debounce).
+  // Update throttle: minimum ms between remote version checks.
   // The plugin only checks for new versions when you run /ac, /ac status,
   // or /auto-continue — this controls how often that check hits GitHub.
-  "checkIntervalMs": 30000
+  "updateThrottleMs": 30000
 }
 ```
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `cooldownMs` | number | `5000` | Minimum ms between auto-continues per session |
+| `throttleMs` | number | `5000` | Retry throttle: minimum ms between auto-continues per session |
 | `delayMs` | number | `2000` | Delay after session idle before sending continue |
 | `maxConsecutive` | number | `5` | Max consecutive auto-continues before giving up |
 | `enabled` | boolean | `true` | Set `false` to disable without removing from plugin list |
-| `checkIntervalMs` | number | `30000` | Debounce for remote version checks (ms). Version is only checked when you run `/ac`, `/ac status`, or `/auto-continue` — this limits how often that check hits GitHub. |
+| `updateThrottleMs` | number | `30000` | Update throttle: minimum ms between remote version checks. Version is only checked when you run `/ac`, `/ac status`, or `/auto-continue` — this limits how often that check hits GitHub. |
 
 All fields are optional — omitted keys use the defaults shown above. You can also manage these settings at runtime via `/auto-continue global <setting> <value>`.
 

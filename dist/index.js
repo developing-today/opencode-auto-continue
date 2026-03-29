@@ -33,7 +33,7 @@ async function readBunLockHash() {
  */
 const DEFAULTS = {
     /** Minimum ms between auto-continues for the same session */
-    cooldownMs: 5_000,
+    throttleMs: 5_000,
     /** Delay after session.idle before sending continue */
     delayMs: 2_000,
     /** Max consecutive auto-continues per session before giving up */
@@ -41,7 +41,7 @@ const DEFAULTS = {
     /** Whether the plugin is enabled */
     enabled: true,
     /** Minimum ms between remote version checks */
-    checkIntervalMs: 30_000,
+    updateThrottleMs: 30_000,
 };
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function parseJsonc(text) {
@@ -95,16 +95,16 @@ async function loadConfig(directory, log) {
         const raw = await readFile(configPath, "utf-8");
         const parsed = parseJsonc(raw);
         const config = { ...DEFAULTS };
-        if (typeof parsed.cooldownMs === "number")
-            config.cooldownMs = parsed.cooldownMs;
+        if (typeof parsed.throttleMs === "number")
+            config.throttleMs = parsed.throttleMs;
         if (typeof parsed.delayMs === "number")
             config.delayMs = parsed.delayMs;
         if (typeof parsed.maxConsecutive === "number")
             config.maxConsecutive = parsed.maxConsecutive;
         if (typeof parsed.enabled === "boolean")
             config.enabled = parsed.enabled;
-        if (typeof parsed.checkIntervalMs === "number")
-            config.checkIntervalMs = parsed.checkIntervalMs;
+        if (typeof parsed.updateThrottleMs === "number")
+            config.updateThrottleMs = parsed.updateThrottleMs;
         log(`Loaded config from ${configPath}: ${JSON.stringify(config)}`);
         return config;
     }
@@ -177,7 +177,7 @@ const plugin = async ({ client, directory }) => {
     async function fetchLatestHash() {
         const cfg = globalConfig;
         const now = Date.now();
-        if (now - lastRemoteCheck < cfg.checkIntervalMs) {
+        if (now - lastRemoteCheck < cfg.updateThrottleMs) {
             return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
         }
         try {
@@ -300,8 +300,9 @@ const plugin = async ({ client, directory }) => {
             return;
         const config = getEffectiveConfig(sessionID);
         const now = Date.now();
-        if (now - state.lastContinueTime < config.cooldownMs) {
-            log(`Cooldown active for session ${sessionID}, skipping`);
+        if (now - state.lastContinueTime < config.throttleMs) {
+            const remaining = config.throttleMs - (now - state.lastContinueTime);
+            log(`Throttle active for session ${sessionID}, ${remaining}ms remaining, skipping`);
             return;
         }
         if (state.consecutiveCount >= config.maxConsecutive) {
@@ -331,22 +332,22 @@ const plugin = async ({ client, directory }) => {
         const parts = [];
         if (overrides.enabled !== undefined)
             parts.push(`enabled: ${overrides.enabled}`);
-        if (overrides.cooldownMs !== undefined)
-            parts.push(`cooldown: ${overrides.cooldownMs}ms`);
+        if (overrides.throttleMs !== undefined)
+            parts.push(`throttle: ${overrides.throttleMs}ms`);
         if (overrides.delayMs !== undefined)
             parts.push(`delay: ${overrides.delayMs}ms`);
         if (overrides.maxConsecutive !== undefined)
             parts.push(`max: ${overrides.maxConsecutive}`);
-        if (overrides.checkIntervalMs !== undefined)
-            parts.push(`check-interval: ${overrides.checkIntervalMs}ms`);
+        if (overrides.updateThrottleMs !== undefined)
+            parts.push(`update-throttle: ${overrides.updateThrottleMs}ms`);
         const globalParts = [
             `enabled: ${globalConfig.enabled}`,
-            `cooldown: ${globalConfig.cooldownMs}ms`,
+            `throttle: ${globalConfig.throttleMs}ms`,
             `delay: ${globalConfig.delayMs}ms`,
             `max: ${globalConfig.maxConsecutive}`,
         ];
-        if (globalConfig.checkIntervalMs !== DEFAULTS.checkIntervalMs) {
-            globalParts.push(`check-interval: ${globalConfig.checkIntervalMs}ms`);
+        if (globalConfig.updateThrottleMs !== DEFAULTS.updateThrottleMs) {
+            globalParts.push(`update-throttle: ${globalConfig.updateThrottleMs}ms`);
         }
         return ["", `  Session overrides: ${parts.join(" · ")}`, `  Global defaults:   ${globalParts.join(" · ")}`];
     }
@@ -355,9 +356,9 @@ const plugin = async ({ client, directory }) => {
         const overrides = sessionConfigs.get(sessionID);
         const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
         const ver = await versionInfo(checkRemote);
-        const summaryParts = [`Cooldown: ${cfg.cooldownMs}ms`, `Delay: ${cfg.delayMs}ms`, `Max: ${cfg.maxConsecutive}`];
-        if (cfg.checkIntervalMs !== DEFAULTS.checkIntervalMs) {
-            summaryParts.push(`Check: ${cfg.checkIntervalMs}ms`);
+        const summaryParts = [`Throttle: ${cfg.throttleMs}ms`, `Delay: ${cfg.delayMs}ms`, `Max: ${cfg.maxConsecutive}`];
+        if (cfg.updateThrottleMs !== DEFAULTS.updateThrottleMs) {
+            summaryParts.push(`Update: ${cfg.updateThrottleMs}ms`);
         }
         const lines = [`  Status: ${status} · ${ver}`, `  ${summaryParts.join(" · ")}`];
         if (overrides && Object.keys(overrides).length > 0) {
@@ -373,7 +374,7 @@ const plugin = async ({ client, directory }) => {
             "",
             ...(await configSummaryLines(sessionID, true)),
         ];
-        lines.push("", "  /auto-continue on|off              Enable/disable (session)", "  /auto-continue cooldown <ms>       Set cooldown (session)", "  /auto-continue delay <ms>          Set delay (session)", "  /auto-continue max <n>             Set max retries (session)", "  /auto-continue check-interval <ms> Set version check interval (session)", "  /auto-continue status              Show current settings", "  /auto-continue reset               Clear session overrides", "  /auto-continue reload              Reload global config from disk", "  /auto-continue global <cmd>        Persist setting to config file", "  /auto-continue global update       Clear cache to fetch latest version", "  /auto-continue help                Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
+        lines.push("", "  /auto-continue on|off              Enable/disable (session)", "  /auto-continue throttle <ms>         Set retry throttle (session)", "  /auto-continue delay <ms>          Set delay (session)", "  /auto-continue max <n>             Set max retries (session)", "  /auto-continue update-throttle <ms>  Set update throttle (session)", "  /auto-continue status              Show current settings", "  /auto-continue reset               Clear session overrides", "  /auto-continue reload              Reload global config from disk", "  /auto-continue global <cmd>        Persist setting to config file", "  /auto-continue global update       Clear cache to fetch latest version", "  /auto-continue help                Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
         return lines.join("\n");
     }
     async function statusText(sessionID) {
@@ -388,28 +389,40 @@ const plugin = async ({ client, directory }) => {
             "",
             `  Version:        ${ver}`,
             `  Enabled:        ${cfg.enabled ? "✅ yes" : "❌ no"}`,
-            `  Cooldown:       ${cfg.cooldownMs}ms`,
+            `  Throttle:        ${cfg.throttleMs}ms`,
             `  Delay:          ${cfg.delayMs}ms`,
             `  Max Retries:    ${cfg.maxConsecutive}`,
+            `  Update throttle: ${cfg.updateThrottleMs}ms`,
         ];
-        if (cfg.checkIntervalMs !== DEFAULTS.checkIntervalMs) {
-            lines.push(`  Check Interval: ${cfg.checkIntervalMs}ms`);
-        }
         if (overrides && Object.keys(overrides).length > 0) {
             lines.push("");
             lines.push("  ── Session Overrides ──");
             if (overrides.enabled !== undefined)
                 lines.push(`  Enabled:        ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`);
-            if (overrides.cooldownMs !== undefined)
-                lines.push(`  Cooldown:       ${overrides.cooldownMs}ms  (global: ${globalConfig.cooldownMs}ms)`);
+            if (overrides.throttleMs !== undefined)
+                lines.push(`  Throttle:        ${overrides.throttleMs}ms  (global: ${globalConfig.throttleMs}ms)`);
             if (overrides.delayMs !== undefined)
                 lines.push(`  Delay:          ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
             if (overrides.maxConsecutive !== undefined)
                 lines.push(`  Max Retries:    ${overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive})`);
-            if (overrides.checkIntervalMs !== undefined)
-                lines.push(`  Check Interval: ${overrides.checkIntervalMs}ms  (global: ${globalConfig.checkIntervalMs}ms)`);
+            if (overrides.updateThrottleMs !== undefined)
+                lines.push(`  Update throttle: ${overrides.updateThrottleMs}ms  (global: ${globalConfig.updateThrottleMs}ms)`);
         }
-        lines.push("", "  ── Session State ──", `  Consecutive retries: ${state?.consecutiveCount ?? 0}`, `  Pending continue:    ${state?.pendingContinue ? "yes" : "no"}`, "", "  ── Global Config ──", `  ${JSON.stringify(globalConfig)}`);
+        const checkRemaining = lastRemoteCheck > 0
+            ? Math.max(0, cfg.updateThrottleMs - (Date.now() - lastRemoteCheck))
+            : null;
+        const retryRemaining = state?.lastContinueTime && state.lastContinueTime > 0
+            ? Math.max(0, cfg.throttleMs - (Date.now() - state.lastContinueTime))
+            : null;
+        lines.push("", "  ── Session State ──");
+        if (retryRemaining !== null) {
+            lines.push(`  Retry cooldown:      ${retryRemaining > 0 ? `${retryRemaining}ms` : "ready"}`);
+        }
+        lines.push(`  Consecutive retries: ${state?.consecutiveCount ?? 0}`, `  Pending continue:    ${state?.pendingContinue ? "yes" : "no"}`);
+        if (checkRemaining !== null) {
+            lines.push(`  Update cooldown:     ${checkRemaining > 0 ? `${checkRemaining}ms` : "ready"}`);
+        }
+        lines.push("", "  ── Global Config ──", `  ${JSON.stringify(globalConfig)}`);
         return lines.join("\n");
     }
     // ── Hooks ───────────────────────────────────────────────────────────────
@@ -432,8 +445,8 @@ const plugin = async ({ client, directory }) => {
             await sendMessage(sessionID, `Auto-continue ${enabled ? "✅ enabled" : "❌ disabled"} for this session.`);
             throw new Error("__AUTO_CONTINUE_HANDLED__");
         }
-        // ── Cooldown / Delay / Max / Check-Interval ──
-        if (subcmd === "cooldown" || subcmd === "delay" || subcmd === "max" || subcmd === "check-interval") {
+        // ── Throttle / Delay / Max / Check-Interval ──
+        if (subcmd === "throttle" || subcmd === "delay" || subcmd === "max" || subcmd === "update-throttle") {
             const value = parseInt(args[1], 10);
             if (isNaN(value) || value < 0) {
                 await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue ${subcmd} <number>`);
@@ -441,20 +454,20 @@ const plugin = async ({ client, directory }) => {
             }
             const overrides = sessionConfigs.get(sessionID) || {};
             const keyMap = {
-                cooldown: "cooldownMs",
+                throttle: "throttleMs",
                 delay: "delayMs",
                 max: "maxConsecutive",
-                "check-interval": "checkIntervalMs",
+                "update-throttle": "updateThrottleMs",
             };
             overrides[keyMap[subcmd]] = value;
             sessionConfigs.set(sessionID, overrides);
-            const label = subcmd === "cooldown"
-                ? "Cooldown"
+            const label = subcmd === "throttle"
+                ? "Throttle"
                 : subcmd === "delay"
                     ? "Delay"
                     : subcmd === "max"
                         ? "Max consecutive"
-                        : "Check interval";
+                        : "Update throttle";
             const unit = subcmd === "max" ? "" : "ms";
             await sendMessage(sessionID, `${label} set to ${value}${unit} for this session.`);
             throw new Error("__AUTO_CONTINUE_HANDLED__");
@@ -598,27 +611,27 @@ const plugin = async ({ client, directory }) => {
                 await sendMessage(sessionID, `Global config: auto-continue ${globalSub === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`);
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
             }
-            if (globalSub === "cooldown" || globalSub === "delay" || globalSub === "max" || globalSub === "check-interval") {
+            if (globalSub === "throttle" || globalSub === "delay" || globalSub === "max" || globalSub === "update-throttle") {
                 const value = parseInt(args[2], 10);
                 if (isNaN(value) || value < 0) {
                     await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue global ${globalSub} <number>`);
                     throw new Error("__AUTO_CONTINUE_HANDLED__");
                 }
                 const keyMap = {
-                    cooldown: "cooldownMs",
+                    throttle: "throttleMs",
                     delay: "delayMs",
                     max: "maxConsecutive",
-                    "check-interval": "checkIntervalMs",
+                    "update-throttle": "updateThrottleMs",
                 };
                 globalConfig[keyMap[globalSub]] = value;
                 await writeGlobalConfig();
-                const label = globalSub === "cooldown"
-                    ? "Cooldown"
+                const label = globalSub === "throttle"
+                    ? "Throttle"
                     : globalSub === "delay"
                         ? "Delay"
                         : globalSub === "max"
                             ? "Max consecutive"
-                            : "Check interval";
+                            : "Update throttle";
                 const unit = globalSub === "max" ? "" : "ms";
                 await sendMessage(sessionID, `Global config: ${label} set to ${value}${unit}. Written to ${CONFIG_FILE}.`);
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
@@ -628,10 +641,10 @@ const plugin = async ({ client, directory }) => {
                 "Usage: /auto-continue global <subcommand>",
                 "",
                 "  on|off              Enable/disable globally",
-                "  cooldown <ms>       Set global cooldown",
+                "  throttle <ms>       Set global retry throttle",
                 "  delay <ms>          Set global delay",
                 "  max <n>             Set global max retries",
-                "  check-interval <ms> Set global version check interval",
+                "  update-throttle <ms> Set global update throttle",
                 "  update              Clear cache to fetch latest version",
             ].join("\n");
             await sendMessage(sessionID, text);
@@ -647,11 +660,11 @@ const plugin = async ({ client, directory }) => {
             opencodeConfig.command ??= {};
             opencodeConfig.command["auto-continue"] = {
                 template: "",
-                description: "Manage auto-continue settings (on/off, cooldown, delay, max, reload)",
+                description: "Manage auto-continue settings (on/off, throttle, delay, max, reload)",
             };
             opencodeConfig.command["ac"] = {
                 template: "",
-                description: "Manage auto-continue settings (on/off, cooldown, delay, max, reload)",
+                description: "Manage auto-continue settings (on/off, throttle, delay, max, reload)",
             };
         },
         // Route both commands to the same handler
