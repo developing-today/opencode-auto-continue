@@ -1,0 +1,40 @@
+{
+  "name": "opencode-auto-continue",
+  "version": "1.0.0",
+  "description": "OpenCode plugin that auto-sends 'continue' when bad request (400) errors occur",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "tsc"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "auto-continue",
+    "error-recovery"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0",
+    "@opencode-ai/sdk": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@opencode-ai/sdk": "1.2.27",
+    "typescript": "^5.0.0"
+  }
+}
