@@ -2,6 +2,8 @@
 
 OpenCode plugin that automatically sends "continue" when bad request (HTTP 400) errors occur, allowing sessions to recover and resume without manual intervention. These errors are often transient — caused by provider rate limits, temporary API issues, or context window edge cases — and a simple retry usually succeeds.
 
+<img width="322" height="162" alt="image" src="https://github.com/user-attachments/assets/51726631-5c5c-474a-8fa1-dd69631140c5" />
+
 ## How It Works
 
 1. **Detects errors**: Listens for `session.error` and `message.updated` events
