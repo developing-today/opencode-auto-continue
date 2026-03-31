@@ -1,6 +1,6 @@
 {
   "cooldownMs": 5,
-  "delayMs": 2000,
+  "delayMs": 500,
   "maxConsecutive": 5,
   "enabled": true,
   "checkIntervalMs": 30000
