@@ -41,7 +41,7 @@ const DEFAULTS = {
   /** Minimum ms between auto-continues for the same session */
   throttleMs: 5_000,
   /** Delay after session.idle before sending continue */
-  delayMs: 2_000,
+  delayMs: 500,
   /** Max consecutive auto-continues per session before giving up (0 = unlimited) */
   maxConsecutive: 5,
   /** Whether the plugin is enabled */
