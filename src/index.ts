@@ -34,10 +34,48 @@ async function readBunLockHash(): Promise<string | null> {
   }
 }
 
+// ─── Default retryable error patterns ───────────────────────────────────────
+// Matched case-insensitively against "${errorName}: ${errorMessage}".
+// Override via config file's "errorPatterns" array.
+
+const DEFAULT_ERROR_PATTERNS: string[] = [
+  // API / provider errors (from DB: 63 occurrences)
+  "bad request",
+  "reasoning_opaque",
+  "prefill",
+  "SSE read timed out",
+  "DecimalError",
+  // Context / compaction errors (from DB: 7 occurrences)
+  "ContextOverflowError",
+  "too large to compact",
+  // Tool execution errors (from GitHub issues)
+  "Invalid diff",
+  "Tool execution aborted",
+  "JSON parsing failed",
+  "Invalid input for tool",
+  "tried to call unavailable tool",
+  "finding less tool calls",
+  "tool_use ids were found without tool_result",
+  // Connection errors (mid-stream, not initial connect)
+  "ECONNREFUSED",
+  "ECONNRESET",
+  // Stream / timeout errors
+  "idle timeout",
+  "no data received",
+  // Type / validation errors
+  "expected string, received undefined",
+];
+
+const DEFAULT_EXCLUDE_PATTERNS: string[] = [
+  // User-initiated abort — never auto-continue
+  "MessageAbortedError",
+  "operation was aborted",
+];
+
 /**
  * Default configuration values.
  */
-const DEFAULTS = {
+const DEFAULTS: Config = {
   /** Minimum ms between auto-continues for the same session */
   throttleMs: 5_000,
   /** Delay after session.idle before sending continue */
@@ -48,7 +86,11 @@ const DEFAULTS = {
   enabled: true,
   /** Minimum ms between remote version checks */
   updateThrottleMs: 30_000,
-} as const;
+  /** Error patterns to auto-continue on (case-insensitive substrings) */
+  errorPatterns: DEFAULT_ERROR_PATTERNS,
+  /** Error patterns to NEVER auto-continue on (checked first, case-insensitive substrings) */
+  excludePatterns: DEFAULT_EXCLUDE_PATTERNS,
+};
 
 interface Config {
   throttleMs: number;
@@ -56,6 +98,8 @@ interface Config {
   maxConsecutive: number;
   enabled: boolean;
   updateThrottleMs: number;
+  errorPatterns: string[];
+  excludePatterns: string[];
 }
 
 interface SessionState {
@@ -119,6 +163,12 @@ async function loadConfig(directory: string, log: (msg: string) => void): Promis
     if (typeof parsed.maxConsecutive === "number") config.maxConsecutive = parsed.maxConsecutive;
     if (typeof parsed.enabled === "boolean") config.enabled = parsed.enabled;
     if (typeof parsed.updateThrottleMs === "number") config.updateThrottleMs = parsed.updateThrottleMs;
+    if (Array.isArray(parsed.errorPatterns)) {
+      config.errorPatterns = parsed.errorPatterns.filter((p): p is string => typeof p === "string");
+    }
+    if (Array.isArray(parsed.excludePatterns)) {
+      config.excludePatterns = parsed.excludePatterns.filter((p): p is string => typeof p === "string");
+    }
 
     log(`Loaded config from ${configPath}: ${JSON.stringify(config)}`);
     return config;
@@ -133,19 +183,27 @@ async function loadConfig(directory: string, log: (msg: string) => void): Promis
   }
 }
 
-function isBadRequestError(error: unknown): boolean {
+function isRetryableError(error: unknown, config: Config): boolean {
   if (!error || typeof error !== "object") return false;
 
   const err = error as Record<string, unknown>;
   const data = err.data as Record<string, unknown> | undefined;
+  const name = typeof err.name === "string" ? err.name : "";
+  const message =
+    (typeof data?.message === "string" ? data.message : null) ??
+    (typeof err.message === "string" ? err.message : "");
 
-  if (err.name === "APIError" || err.name === "ApiError") {
-    if (data?.statusCode === 400) return true;
-    if (typeof data?.message === "string" && data.message.toLowerCase().includes("bad request")) return true;
+  // Build a single matchable string: "ErrorName: error message text"
+  const matchStr = `${name}: ${message}`.toLowerCase();
+
+  // Exclude patterns checked first — if any match, never retry
+  for (const pattern of config.excludePatterns) {
+    if (matchStr.includes(pattern.toLowerCase())) return false;
   }
 
-  if (err.name === "UnknownError") {
-    if (typeof data?.message === "string" && data.message.toLowerCase().includes("bad request")) return true;
+  // Error patterns — if any match, retry
+  for (const pattern of config.errorPatterns) {
+    if (matchStr.includes(pattern.toLowerCase())) return true;
   }
 
   return false;
@@ -301,7 +359,21 @@ const plugin: Plugin = async ({ client, directory }) => {
   // Write current globalConfig to disk
   async function writeGlobalConfig() {
     const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
-    const content = JSON.stringify(globalConfig, null, 2) + "\n";
+    // Omit pattern arrays from disk if they're still the defaults
+    const toWrite: Record<string, unknown> = {
+      throttleMs: globalConfig.throttleMs,
+      delayMs: globalConfig.delayMs,
+      maxConsecutive: globalConfig.maxConsecutive,
+      enabled: globalConfig.enabled,
+      updateThrottleMs: globalConfig.updateThrottleMs,
+    };
+    if (globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS) {
+      toWrite.errorPatterns = globalConfig.errorPatterns;
+    }
+    if (globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS) {
+      toWrite.excludePatterns = globalConfig.excludePatterns;
+    }
+    const content = JSON.stringify(toWrite, null, 2) + "\n";
     await writeFile(configPath, content, "utf-8");
     log(`Wrote global config to ${configPath}`);
   }
@@ -414,8 +486,9 @@ const plugin: Plugin = async ({ client, directory }) => {
       "  /auto-continue max <n>             Set max retries (session, 0=unlimited)",
       "  /auto-continue update-throttle <ms>  Set update throttle (session)",
       "  /auto-continue status              Show current settings",
-      "  /auto-continue reset               Clear session overrides",
+      "  /auto-continue patterns            Show active error patterns",
       "  /auto-continue reload              Reload global config from disk",
+      "  /auto-continue reset               Clear session overrides",
       "  /auto-continue global <cmd>        Persist setting to config file",
       "  /auto-continue global update       Clear cache to fetch latest version",
       "  /auto-continue help                Show this help",
@@ -485,7 +558,16 @@ const plugin: Plugin = async ({ client, directory }) => {
     lines.push(
       "",
       "  ── Global Config ──",
-      `  ${JSON.stringify(globalConfig)}`,
+      `  ${JSON.stringify({ ...globalConfig, errorPatterns: `[${globalConfig.errorPatterns.length} patterns]`, excludePatterns: `[${globalConfig.excludePatterns.length} patterns]` })}`,
+    );
+
+    const isCustomPatterns = globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS;
+    const isCustomExcludes = globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
+    lines.push(
+      "",
+      `  ── Error Patterns (${cfg.errorPatterns.length} match, ${cfg.excludePatterns.length} exclude) ──`,
+      `  Patterns: ${isCustomPatterns ? "custom" : "default"}  ·  Excludes: ${isCustomExcludes ? "custom" : "default"}`,
+      "  Run /ac patterns for full list",
     );
     return lines.join("\n");
   }
@@ -548,6 +630,29 @@ const plugin: Plugin = async ({ client, directory }) => {
     // ── Status ──
     if (subcmd === "status") {
       await sendMessage(sessionID, await statusText(sessionID));
+      throw new Error("__AUTO_CONTINUE_HANDLED__");
+    }
+
+    // ── Patterns (show all active error patterns) ──
+    if (subcmd === "patterns") {
+      const cfg = getEffectiveConfig(sessionID);
+      const isCustom = cfg.errorPatterns !== DEFAULT_ERROR_PATTERNS;
+      const isCustomExcl = cfg.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
+      const lines = [
+        "╭──────────────────────────────────────────╮",
+        "│       Error Patterns                     │",
+        "╰──────────────────────────────────────────╯",
+        "",
+        `  ── Match Patterns (${cfg.errorPatterns.length}) ${isCustom ? "[custom]" : "[default]"} ──`,
+        ...cfg.errorPatterns.map(p => `    • ${p}`),
+        "",
+        `  ── Exclude Patterns (${cfg.excludePatterns.length}) ${isCustomExcl ? "[custom]" : "[default]"} ──`,
+        ...cfg.excludePatterns.map(p => `    ✕ ${p}`),
+        "",
+        "  Matching: case-insensitive substring against \"ErrorName: message\"",
+        "  Excludes are checked first. Override via config file.",
+      ];
+      await sendMessage(sessionID, lines.join("\n"));
       throw new Error("__AUTO_CONTINUE_HANDLED__");
     }
 
@@ -785,7 +890,7 @@ const plugin: Plugin = async ({ client, directory }) => {
 
     // React to events for auto-continue behavior
     event: async ({ event }) => {
-      // ── session.error: detect bad request errors ──
+      // ── session.error: detect retryable errors ──
       if (event.type === "session.error") {
         const props = event.properties as {
           sessionID?: string;
@@ -797,8 +902,8 @@ const plugin: Plugin = async ({ client, directory }) => {
         const config = getEffectiveConfig(sessionID);
         if (!config.enabled) return;
 
-        if (isBadRequestError(error)) {
-          log(`Bad request error in ${sessionID}: ${errorMessage(error)}`);
+        if (isRetryableError(error, config)) {
+          log(`Retryable error in ${sessionID}: ${errorMessage(error)}`);
           const state = getState(sessionID);
           state.lastErrorTime = Date.now();
           state.pendingContinue = true;
@@ -820,9 +925,9 @@ const plugin: Plugin = async ({ client, directory }) => {
 
         const config = getEffectiveConfig(info.sessionID);
 
-        // Bad request on assistant message
-        if (config.enabled && isBadRequestError(info.error)) {
-          log(`Bad request on assistant message in ${info.sessionID}: ${errorMessage(info.error)}`);
+        // Retryable error on assistant message
+        if (config.enabled && isRetryableError(info.error, config)) {
+          log(`Retryable error on assistant message in ${info.sessionID}: ${errorMessage(info.error)}`);
           const state = getState(info.sessionID);
           state.lastErrorTime = Date.now();
           state.pendingContinue = true;

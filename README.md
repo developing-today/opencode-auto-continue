@@ -1,14 +1,14 @@
 # opencode-auto-continue
 
-OpenCode plugin that automatically sends "continue" when bad request (HTTP 400) errors occur, allowing sessions to recover and resume without manual intervention. These errors are often transient — caused by provider rate limits, temporary API issues, or context window edge cases — and a simple retry usually succeeds.
+OpenCode plugin that automatically sends "continue" when transient errors occur, allowing sessions to recover and resume without manual intervention. Handles API errors, provider issues, context overflow, connection resets, tool failures, and more — with configurable error patterns so you control exactly which errors trigger a retry.
 
 <img width="322" height="162" alt="image" src="https://github.com/user-attachments/assets/51726631-5c5c-474a-8fa1-dd69631140c5" />
 
 ## How It Works
 
 1. **Detects errors**: Listens for `session.error` and `message.updated` events
-2. **Identifies bad requests**: Checks for `ApiError` with status code 400 or messages containing "bad request"
-3. **Waits for idle**: When the session becomes idle after an error, sends "continue" via `promptAsync`
+2. **Pattern matching**: Matches error name + message against configurable patterns (case-insensitive substrings). Exclude patterns are checked first to prevent retrying user-initiated aborts.
+3. **Waits for idle**: When the session becomes idle after a matched error, sends "continue" via `promptAsync`
 4. **Safety limits**: Configurable throttle and max consecutive retries prevent infinite loops
 5. **Auto-reset**: Consecutive retry counter resets when a message completes successfully
 
@@ -46,6 +46,7 @@ The plugin registers `/auto-continue` (and `/ac` as a shorthand alias) for manag
 | `/auto-continue max <n>` | Set max consecutive retries (session) |
 | `/auto-continue update-throttle <ms>` | Set update throttle (session) |
 | `/auto-continue status` | Show full status, config details, and version check |
+| `/auto-continue patterns` | Show all active error match/exclude patterns |
 | `/auto-continue reload` | Reload global config from disk |
 | `/auto-continue reset` | Clear session overrides, revert to global |
 | `/auto-continue global on\|off` | Enable/disable globally (writes config) |
@@ -77,7 +78,7 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
   "throttleMs": 5000,
 
   // Delay after session becomes idle before sending continue
-  "delayMs": 2000,
+  "delayMs": 500,
 
   // Max consecutive auto-continues per session before giving up (0 = unlimited)
   "maxConsecutive": 5,
@@ -92,15 +93,83 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
 }
 ```
 
+### Settings Reference
+
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `throttleMs` | number | `5000` | Retry throttle: minimum ms between auto-continues per session |
-| `delayMs` | number | `2000` | Delay after session idle before sending continue |
+| `delayMs` | number | `500` | Delay after session idle before sending continue |
 | `maxConsecutive` | number | `5` | Max consecutive auto-continues before giving up (0 = unlimited) |
 | `enabled` | boolean | `true` | Set `false` to disable without removing from plugin list |
-| `updateThrottleMs` | number | `30000` | Update throttle: minimum ms between remote version checks. Version is only checked when you run `/ac`, `/ac status`, or `/auto-continue` — this limits how often that check hits GitHub. |
+| `updateThrottleMs` | number | `30000` | Update throttle: minimum ms between remote version checks |
+| `errorPatterns` | string[] | *(see below)* | Error substrings that trigger auto-continue (case-insensitive) |
+| `excludePatterns` | string[] | *(see below)* | Error substrings that **never** trigger auto-continue (checked first) |
 
-All fields are optional — omitted keys use the defaults shown above. You can also manage these settings at runtime via `/auto-continue global <setting> <value>`.
+All fields are optional — omitted keys use the defaults shown above. You can also manage timing settings at runtime via `/auto-continue global <setting> <value>`.
+
+### Error Patterns
+
+The plugin matches each error against a list of patterns. The error is formatted as `"ErrorName: error message"` and each pattern is matched as a case-insensitive substring.
+
+**Exclude patterns are checked first** — if any exclude pattern matches, the error is never retried, even if a match pattern also matches.
+
+Run `/ac patterns` to see the full list of active patterns at any time.
+
+#### Default Match Patterns (19)
+
+These cover the most common transient errors observed across OpenCode sessions:
+
+| Pattern | Catches |
+|---------|---------|
+| `bad request` | APIError 400 responses |
+| `reasoning_opaque` | Multiple reasoning values in single response |
+| `prefill` | Assistant message prefill not supported |
+| `SSE read timed out` | Server-sent event stream timeouts |
+| `DecimalError` | Invalid decimal argument errors |
+| `ContextOverflowError` | Session too large to compact |
+| `too large to compact` | Context exceeds model limit after stripping |
+| `Invalid diff` | Malformed diff in tool output |
+| `Tool execution aborted` | Tool execution failures |
+| `JSON parsing failed` | JSON parse errors in tool responses |
+| `Invalid input for tool` | Bad tool input validation |
+| `tried to call unavailable tool` | Tool not available |
+| `finding less tool calls` | Tool call count mismatch |
+| `tool_use ids were found without tool_result` | Missing tool results |
+| `ECONNREFUSED` | Connection refused (mid-stream) |
+| `ECONNRESET` | Connection reset (mid-stream) |
+| `idle timeout` | Idle timeout on connection |
+| `no data received` | Empty response from provider |
+| `expected string, received undefined` | Type validation errors |
+
+#### Default Exclude Patterns (2)
+
+| Pattern | Why excluded |
+|---------|-------------|
+| `MessageAbortedError` | User-initiated abort (Ctrl+C / stop button) |
+| `operation was aborted` | Catches abort messages regardless of error name |
+
+#### Custom Patterns
+
+To override the defaults, add `errorPatterns` and/or `excludePatterns` to your config file:
+
+```jsonc
+{
+  // Replace ALL default match patterns with your own
+  "errorPatterns": [
+    "bad request",
+    "reasoning_opaque",
+    "my custom error"
+  ],
+
+  // Replace ALL default exclude patterns with your own
+  "excludePatterns": [
+    "MessageAbortedError",
+    "operation was aborted"
+  ]
+}
+```
+
+**Note:** Setting `errorPatterns` or `excludePatterns` in the config replaces the entire default list, not appends to it. Include any defaults you want to keep. When these fields are omitted, the built-in defaults are used and are **not** written to the config file.
 
 ## Logs
 
@@ -108,8 +177,8 @@ The plugin logs all activity with the `[opencode-auto-continue]` prefix:
 
 ```
 [opencode-auto-continue] No config file at /home/user/.opencode/opencode-auto-continue.jsonc, using defaults
-[opencode-auto-continue] Bad request error in session abc123: Bad Request
-[opencode-auto-continue] abc123 idle with pending continue, waiting 2000ms...
+[opencode-auto-continue] Retryable error in abc123: Multiple reasoning_opaque values received...
+[opencode-auto-continue] abc123 idle with pending continue, waiting 500ms...
 [opencode-auto-continue] Sending "continue" to abc123 (attempt 1/5)
 [opencode-auto-continue] Successfully sent "continue" to abc123
 ```

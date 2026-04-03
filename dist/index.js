@@ -28,6 +28,41 @@ async function readBunLockHash() {
         return null;
     }
 }
+// ─── Default retryable error patterns ───────────────────────────────────────
+// Matched case-insensitively against "${errorName}: ${errorMessage}".
+// Override via config file's "errorPatterns" array.
+const DEFAULT_ERROR_PATTERNS = [
+    // API / provider errors (from DB: 63 occurrences)
+    "bad request",
+    "reasoning_opaque",
+    "prefill",
+    "SSE read timed out",
+    "DecimalError",
+    // Context / compaction errors (from DB: 7 occurrences)
+    "ContextOverflowError",
+    "too large to compact",
+    // Tool execution errors (from GitHub issues)
+    "Invalid diff",
+    "Tool execution aborted",
+    "JSON parsing failed",
+    "Invalid input for tool",
+    "tried to call unavailable tool",
+    "finding less tool calls",
+    "tool_use ids were found without tool_result",
+    // Connection errors (mid-stream, not initial connect)
+    "ECONNREFUSED",
+    "ECONNRESET",
+    // Stream / timeout errors
+    "idle timeout",
+    "no data received",
+    // Type / validation errors
+    "expected string, received undefined",
+];
+const DEFAULT_EXCLUDE_PATTERNS = [
+    // User-initiated abort — never auto-continue
+    "MessageAbortedError",
+    "operation was aborted",
+];
 /**
  * Default configuration values.
  */
@@ -42,6 +77,10 @@ const DEFAULTS = {
     enabled: true,
     /** Minimum ms between remote version checks */
     updateThrottleMs: 30_000,
+    /** Error patterns to auto-continue on (case-insensitive substrings) */
+    errorPatterns: DEFAULT_ERROR_PATTERNS,
+    /** Error patterns to NEVER auto-continue on (checked first, case-insensitive substrings) */
+    excludePatterns: DEFAULT_EXCLUDE_PATTERNS,
 };
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function parseJsonc(text) {
@@ -105,6 +144,12 @@ async function loadConfig(directory, log) {
             config.enabled = parsed.enabled;
         if (typeof parsed.updateThrottleMs === "number")
             config.updateThrottleMs = parsed.updateThrottleMs;
+        if (Array.isArray(parsed.errorPatterns)) {
+            config.errorPatterns = parsed.errorPatterns.filter((p) => typeof p === "string");
+        }
+        if (Array.isArray(parsed.excludePatterns)) {
+            config.excludePatterns = parsed.excludePatterns.filter((p) => typeof p === "string");
+        }
         log(`Loaded config from ${configPath}: ${JSON.stringify(config)}`);
         return config;
     }
@@ -119,19 +164,24 @@ async function loadConfig(directory, log) {
         return { ...DEFAULTS };
     }
 }
-function isBadRequestError(error) {
+function isRetryableError(error, config) {
     if (!error || typeof error !== "object")
         return false;
     const err = error;
     const data = err.data;
-    if (err.name === "APIError" || err.name === "ApiError") {
-        if (data?.statusCode === 400)
-            return true;
-        if (typeof data?.message === "string" && data.message.toLowerCase().includes("bad request"))
-            return true;
+    const name = typeof err.name === "string" ? err.name : "";
+    const message = (typeof data?.message === "string" ? data.message : null) ??
+        (typeof err.message === "string" ? err.message : "");
+    // Build a single matchable string: "ErrorName: error message text"
+    const matchStr = `${name}: ${message}`.toLowerCase();
+    // Exclude patterns checked first — if any match, never retry
+    for (const pattern of config.excludePatterns) {
+        if (matchStr.includes(pattern.toLowerCase()))
+            return false;
     }
-    if (err.name === "UnknownError") {
-        if (typeof data?.message === "string" && data.message.toLowerCase().includes("bad request"))
+    // Error patterns — if any match, retry
+    for (const pattern of config.errorPatterns) {
+        if (matchStr.includes(pattern.toLowerCase()))
             return true;
     }
     return false;
@@ -277,7 +327,21 @@ const plugin = async ({ client, directory }) => {
     // Write current globalConfig to disk
     async function writeGlobalConfig() {
         const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
-        const content = JSON.stringify(globalConfig, null, 2) + "\n";
+        // Omit pattern arrays from disk if they're still the defaults
+        const toWrite = {
+            throttleMs: globalConfig.throttleMs,
+            delayMs: globalConfig.delayMs,
+            maxConsecutive: globalConfig.maxConsecutive,
+            enabled: globalConfig.enabled,
+            updateThrottleMs: globalConfig.updateThrottleMs,
+        };
+        if (globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS) {
+            toWrite.errorPatterns = globalConfig.errorPatterns;
+        }
+        if (globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS) {
+            toWrite.excludePatterns = globalConfig.excludePatterns;
+        }
+        const content = JSON.stringify(toWrite, null, 2) + "\n";
         await writeFile(configPath, content, "utf-8");
         log(`Wrote global config to ${configPath}`);
     }
@@ -376,7 +440,7 @@ const plugin = async ({ client, directory }) => {
             "",
             ...(await configSummaryLines(sessionID, true)),
         ];
-        lines.push("", "  /auto-continue on|off              Enable/disable (session)", "  /auto-continue throttle <ms>         Set retry throttle (session)", "  /auto-continue delay <ms>          Set delay (session)", "  /auto-continue max <n>             Set max retries (session, 0=unlimited)", "  /auto-continue update-throttle <ms>  Set update throttle (session)", "  /auto-continue status              Show current settings", "  /auto-continue reset               Clear session overrides", "  /auto-continue reload              Reload global config from disk", "  /auto-continue global <cmd>        Persist setting to config file", "  /auto-continue global update       Clear cache to fetch latest version", "  /auto-continue help                Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
+        lines.push("", "  /auto-continue on|off              Enable/disable (session)", "  /auto-continue throttle <ms>         Set retry throttle (session)", "  /auto-continue delay <ms>          Set delay (session)", "  /auto-continue max <n>             Set max retries (session, 0=unlimited)", "  /auto-continue update-throttle <ms>  Set update throttle (session)", "  /auto-continue status              Show current settings", "  /auto-continue patterns            Show active error patterns", "  /auto-continue reload              Reload global config from disk", "  /auto-continue reset               Clear session overrides", "  /auto-continue global <cmd>        Persist setting to config file", "  /auto-continue global update       Clear cache to fetch latest version", "  /auto-continue help                Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
         return lines.join("\n");
     }
     async function statusText(sessionID) {
@@ -424,7 +488,10 @@ const plugin = async ({ client, directory }) => {
         if (checkRemaining !== null) {
             lines.push(`  Update cooldown:     ${checkRemaining > 0 ? `${checkRemaining}ms` : "ready"}`);
         }
-        lines.push("", "  ── Global Config ──", `  ${JSON.stringify(globalConfig)}`);
+        lines.push("", "  ── Global Config ──", `  ${JSON.stringify({ ...globalConfig, errorPatterns: `[${globalConfig.errorPatterns.length} patterns]`, excludePatterns: `[${globalConfig.excludePatterns.length} patterns]` })}`);
+        const isCustomPatterns = globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS;
+        const isCustomExcludes = globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
+        lines.push("", `  ── Error Patterns (${cfg.errorPatterns.length} match, ${cfg.excludePatterns.length} exclude) ──`, `  Patterns: ${isCustomPatterns ? "custom" : "default"}  ·  Excludes: ${isCustomExcludes ? "custom" : "default"}`, "  Run /ac patterns for full list");
         return lines.join("\n");
     }
     // ── Hooks ───────────────────────────────────────────────────────────────
@@ -477,6 +544,28 @@ const plugin = async ({ client, directory }) => {
         // ── Status ──
         if (subcmd === "status") {
             await sendMessage(sessionID, await statusText(sessionID));
+            throw new Error("__AUTO_CONTINUE_HANDLED__");
+        }
+        // ── Patterns (show all active error patterns) ──
+        if (subcmd === "patterns") {
+            const cfg = getEffectiveConfig(sessionID);
+            const isCustom = cfg.errorPatterns !== DEFAULT_ERROR_PATTERNS;
+            const isCustomExcl = cfg.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
+            const lines = [
+                "╭──────────────────────────────────────────╮",
+                "│       Error Patterns                     │",
+                "╰──────────────────────────────────────────╯",
+                "",
+                `  ── Match Patterns (${cfg.errorPatterns.length}) ${isCustom ? "[custom]" : "[default]"} ──`,
+                ...cfg.errorPatterns.map(p => `    • ${p}`),
+                "",
+                `  ── Exclude Patterns (${cfg.excludePatterns.length}) ${isCustomExcl ? "[custom]" : "[default]"} ──`,
+                ...cfg.excludePatterns.map(p => `    ✕ ${p}`),
+                "",
+                "  Matching: case-insensitive substring against \"ErrorName: message\"",
+                "  Excludes are checked first. Override via config file.",
+            ];
+            await sendMessage(sessionID, lines.join("\n"));
             throw new Error("__AUTO_CONTINUE_HANDLED__");
         }
         // ── Reload (re-read global config from disk) ──
@@ -677,7 +766,7 @@ const plugin = async ({ client, directory }) => {
         },
         // React to events for auto-continue behavior
         event: async ({ event }) => {
-            // ── session.error: detect bad request errors ──
+            // ── session.error: detect retryable errors ──
             if (event.type === "session.error") {
                 const props = event.properties;
                 const { sessionID, error } = props;
@@ -686,8 +775,8 @@ const plugin = async ({ client, directory }) => {
                 const config = getEffectiveConfig(sessionID);
                 if (!config.enabled)
                     return;
-                if (isBadRequestError(error)) {
-                    log(`Bad request error in ${sessionID}: ${errorMessage(error)}`);
+                if (isRetryableError(error, config)) {
+                    log(`Retryable error in ${sessionID}: ${errorMessage(error)}`);
                     const state = getState(sessionID);
                     state.lastErrorTime = Date.now();
                     state.pendingContinue = true;
@@ -700,9 +789,9 @@ const plugin = async ({ client, directory }) => {
                 if (!info?.sessionID || info.role !== "assistant")
                     return;
                 const config = getEffectiveConfig(info.sessionID);
-                // Bad request on assistant message
-                if (config.enabled && isBadRequestError(info.error)) {
-                    log(`Bad request on assistant message in ${info.sessionID}: ${errorMessage(info.error)}`);
+                // Retryable error on assistant message
+                if (config.enabled && isRetryableError(info.error, config)) {
+                    log(`Retryable error on assistant message in ${info.sessionID}: ${errorMessage(info.error)}`);
                     const state = getState(info.sessionID);
                     state.lastErrorTime = Date.now();
                     state.pendingContinue = true;

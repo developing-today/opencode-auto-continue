@@ -1,7 +1,7 @@
 {
-  "cooldownMs": 5,
+  "throttleMs": 5000,
   "delayMs": 500,
   "maxConsecutive": 5,
   "enabled": true,
-  "checkIntervalMs": 30000
+  "updateThrottleMs": 30000
 }
