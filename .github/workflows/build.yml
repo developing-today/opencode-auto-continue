@@ -31,7 +31,7 @@ jobs:
       # Prefer GH_TOKEN secret (allows triggering downstream workflows like tag-latest)
       # Fall back to GITHUB_TOKEN (won't trigger other workflows)
       TOKEN: ${{ secrets.GH_TOKEN || github.token }}
-      COMMIT_PREFIX: "build: "
+      COMMIT_PREFIX: "ci-build: "
 
     steps:
       # ── 1. Skip check: bail if the triggering commit is from this workflow ──

@@ -53,7 +53,7 @@ jobs:
 
       - name: Create dated release (marked as latest)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
         run: |
           gh release create "${{ steps.vars.outputs.dated_tag }}" \
             --title "${{ steps.vars.outputs.dated_tag }}" \
@@ -66,7 +66,7 @@ jobs:
 
       - name: Create/update latest release (not marked as latest)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
         run: |
           # Delete existing latest release if present
           gh release delete latest --yes 2>/dev/null || true
