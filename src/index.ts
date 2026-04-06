@@ -366,6 +366,8 @@ const plugin: Plugin = async ({ client, directory }) => {
   let lastRemoteCheck = 0;
   let cachedRemoteHash: string | null = null;
   let cachedCommitSha: string | null = null;
+  // Commit SHA for the loaded version — captured when loaded matches remote
+  let loadedCommitSha: string | null = null;
 
   /** Check whether the cached module has been cleared (by global update in any session) */
   async function isCacheCleared(): Promise<boolean> {
@@ -411,6 +413,10 @@ const plugin: Plugin = async ({ client, directory }) => {
       const commitLine = bodyLines.find((l: string) => l.startsWith("Commit: "));
       cachedCommitSha = commitLine?.replace("Commit: ", "").trim() ?? null;
       lastRemoteCheck = now;
+      // Remember commit SHA for loaded version when it matches remote
+      if (loadedHash && cachedRemoteHash === loadedHash && cachedCommitSha && !loadedCommitSha) {
+        loadedCommitSha = cachedCommitSha;
+      }
     } catch {
       // Network failure — keep stale cache
     }
@@ -432,7 +438,9 @@ const plugin: Plugin = async ({ client, directory }) => {
       const { hash: remoteHash, commitSha } = await fetchLatestHash();
       const remoteShort = remoteHash ? shortHash(remoteHash) : null;
       const shortSha = commitSha?.substring(0, 7) ?? "";
-      const commitSuffix = shortSha ? ` (commit: ${shortSha})` : "";
+      const loadedSha = loadedCommitSha?.substring(0, 7) ?? "";
+      const remoteCommitSuffix = shortSha ? ` (commit: ${shortSha})` : "";
+      const loadedCommitSuffix = loadedSha ? ` (commit: ${loadedSha})` : "";
 
       if (remoteHash && remoteShort) {
         const matchesLoaded = loadedHash === remoteHash;
@@ -441,9 +449,9 @@ const plugin: Plugin = async ({ client, directory }) => {
 
         // Base version — include commit when up-to-date
         if (matchesLoaded && matchesCurrent) {
-          lines.push(`${loadedShort}${commitSuffix}`);
+          lines.push(`${loadedShort}${remoteCommitSuffix}`);
         } else {
-          lines.push(loadedShort);
+          lines.push(`${loadedShort}${loadedCommitSuffix}`);
         }
 
         if (localUpdated) {
@@ -455,10 +463,10 @@ const plugin: Plugin = async ({ client, directory }) => {
         } else if (!localUpdated && !matchesLoaded) {
           // loaded == current, remote is different → update available
           if (cacheCleared) {
-            lines.push(`  🆕 Update ready: ${loadedShort} → ${remoteShort}${commitSuffix}`);
+            lines.push(`  🆕 Update ready: ${loadedShort}${loadedCommitSuffix} → ${remoteShort}${remoteCommitSuffix}`);
             lines.push(`     Restart opencode to load the new version`);
           } else {
-            lines.push(`  🆕 Update available: ${loadedShort} → ${remoteShort}${commitSuffix}`);
+            lines.push(`  🆕 Update available: ${loadedShort}${loadedCommitSuffix} → ${remoteShort}${remoteCommitSuffix}`);
             lines.push(`     Run /ac global update then restart opencode`);
           }
         } else if (localUpdated && matchesCurrent) {
@@ -466,11 +474,11 @@ const plugin: Plugin = async ({ client, directory }) => {
         } else if (localUpdated && !matchesCurrent && !matchesLoaded) {
           // All three differ: loaded ≠ current ≠ remote
           if (cacheCleared) {
-            lines.push(`  🆕 Newer version available: ${loadedShort} → ${remoteShort}${commitSuffix}`);
+            lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCommitSuffix} → ${remoteShort}${remoteCommitSuffix}`);
             lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
             lines.push(`     Restart opencode to load the new version`);
           } else {
-            lines.push(`  🆕 Newer version available: ${loadedShort} → ${remoteShort}${commitSuffix}`);
+            lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCommitSuffix} → ${remoteShort}${remoteCommitSuffix}`);
             lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
             lines.push(`     Run /ac global update then restart opencode`);
           }
@@ -884,6 +892,9 @@ const plugin: Plugin = async ({ client, directory }) => {
               cachedRemoteHash = remoteHash;
               cachedCommitSha = commitSha ?? null;
               lastRemoteCheck = Date.now();
+              if (loadedHash && remoteHash === loadedHash && commitSha && !loadedCommitSha) {
+                loadedCommitSha = commitSha;
+              }
             }
           } catch {
             // Network failure — continue with cleanup anyway
@@ -944,10 +955,13 @@ const plugin: Plugin = async ({ client, directory }) => {
           await tryRm(getNpmCacheDir(), { recursive: true, label: "npm cache" });
 
           // 3. Report results
+          const loadedSha = loadedCommitSha?.substring(0, 7) ?? "";
+          const loadedSuffix = loadedSha ? ` (commit: ${loadedSha})` : "";
+          const remoteSuffix = shortSha !== "unknown" ? ` (commit: ${shortSha})` : "";
           const versionLine = isUpToDate
-            ? `✅ Already up to date: ${currentShort} (commit: ${shortSha})`
+            ? `✅ Already up to date: ${currentShort}${remoteSuffix}`
             : remoteHash
-              ? `🆕 Update available: ${currentShort} → ${remoteShort} (commit: ${shortSha})`
+              ? `🆕 Update available: ${currentShort}${loadedSuffix} → ${remoteShort}${remoteSuffix}`
               : `⚠️  Could not check remote version (loaded: ${currentShort})`;
 
           const msg = [
