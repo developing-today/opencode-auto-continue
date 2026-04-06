@@ -390,33 +390,39 @@ const plugin = async ({ client, directory }) => {
         const currentHash = await readInstalledHash();
         const currentShort = currentHash ? shortHash(currentHash) : "unknown";
         const lines = [];
-        // Base version
-        lines.push(loadedShort);
         // Local: loaded vs current bun.lock
         const localUpdated = loadedHash && currentHash && loadedHash !== currentHash;
-        if (localUpdated) {
-            lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
-        }
         // Remote check (only when requested — status, help with /ac)
         if (checkRemote) {
             const { hash: remoteHash, commitSha } = await fetchLatestHash();
             const remoteShort = remoteHash ? shortHash(remoteHash) : null;
             const shortSha = commitSha?.substring(0, 7) ?? "";
+            const commitSuffix = shortSha ? ` (commit: ${shortSha})` : "";
             if (remoteHash && remoteShort) {
                 const matchesLoaded = loadedHash === remoteHash;
                 const matchesCurrent = currentHash === remoteHash;
                 const cacheCleared = await isCacheCleared();
+                // Base version — include commit when up-to-date
                 if (matchesLoaded && matchesCurrent) {
-                    // All same — nothing to add
+                    lines.push(`${loadedShort}${commitSuffix}`);
+                }
+                else {
+                    lines.push(loadedShort);
+                }
+                if (localUpdated) {
+                    lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
+                }
+                if (matchesLoaded && matchesCurrent) {
+                    // All same — already shown commit above
                 }
                 else if (!localUpdated && !matchesLoaded) {
                     // loaded == current, remote is different → update available
                     if (cacheCleared) {
-                        lines.push(`  🆕 Update ready: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+                        lines.push(`  🆕 Update ready: ${remoteShort}${commitSuffix}`);
                         lines.push(`     Restart opencode to load the new version`);
                     }
                     else {
-                        lines.push(`  🆕 Update available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+                        lines.push(`  🆕 Update available: ${remoteShort}${commitSuffix}`);
                         lines.push(`     Run /ac global update then restart opencode`);
                     }
                 }
@@ -426,16 +432,30 @@ const plugin = async ({ client, directory }) => {
                 else if (localUpdated && !matchesCurrent && !matchesLoaded) {
                     // All three differ: loaded ≠ current ≠ remote
                     if (cacheCleared) {
-                        lines.push(`  🆕 Newer version available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+                        lines.push(`  🆕 Newer version available: ${remoteShort}${commitSuffix}`);
                         lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
                         lines.push(`     Restart opencode to load the new version`);
                     }
                     else {
-                        lines.push(`  🆕 Newer version available: ${remoteShort}${shortSha ? ` (${shortSha})` : ""}`);
+                        lines.push(`  🆕 Newer version available: ${remoteShort}${commitSuffix}`);
                         lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
                         lines.push(`     Run /ac global update then restart opencode`);
                     }
                 }
+            }
+            else {
+                // Remote fetch failed or no remote hash — show base version without commit
+                lines.push(loadedShort);
+                if (localUpdated) {
+                    lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
+                }
+            }
+        }
+        else {
+            // No remote check — just show base version
+            lines.push(loadedShort);
+            if (localUpdated) {
+                lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
             }
         }
         return lines.join("\n");
