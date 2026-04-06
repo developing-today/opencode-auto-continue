@@ -1,4 +1,4 @@
-import { access, lstat, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_DIR = ".opencode";
@@ -6,6 +6,7 @@ const CONFIG_FILE = `${PLUGIN_NAME}.jsonc`;
 const GITHUB_REPO = "developing-today/opencode-auto-continue";
 const GITHUB_API_COMMITS = `https://api.github.com/repos/${GITHUB_REPO}/commits/main`;
 const GITHUB_API_RELEASE = `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/latest`;
+const LOADED_COMMIT_FILE = "auto-continue-loaded-commit";
 function getOpencodeDirs() {
     const home = process.env.HOME || process.env.USERPROFILE || "";
     const xdgConfig = process.env.XDG_CONFIG_HOME || join(home, ".config");
@@ -146,6 +147,29 @@ async function searchDirForHash(dir, depth = 0) {
     catch { }
     return null;
 }
+// ─── Persistent loaded-commit cache ─────────────────────────────────────────
+// Stores the commit SHA associated with the loaded content hash so it survives
+// restarts. Lives in the XDG cache dir and gets wiped by /ac global update.
+async function readLoadedCommitFile() {
+    try {
+        const { cache } = getOpencodeDirs();
+        const content = await readFile(join(cache, LOADED_COMMIT_FILE), "utf-8");
+        const lines = content.trim().split("\n");
+        if (lines.length >= 2 && lines[0] && lines[1]) {
+            return { hash: lines[0], commitSha: lines[1] };
+        }
+    }
+    catch { }
+    return null;
+}
+async function writeLoadedCommitFile(hash, commitSha) {
+    try {
+        const { cache } = getOpencodeDirs();
+        await mkdir(cache, { recursive: true });
+        await writeFile(join(cache, LOADED_COMMIT_FILE), `${hash}\n${commitSha}\n`, "utf-8");
+    }
+    catch { }
+}
 // ─── Default retryable error patterns ───────────────────────────────────────
 // Matched case-insensitively against "${errorName}: ${errorMessage}".
 // Override via config file's "errorPatterns" array.
@@ -195,6 +219,8 @@ const DEFAULTS = {
     enabled: true,
     /** Minimum ms between remote version checks */
     updateThrottleMs: 30_000,
+    /** Disable all remote calls and version-related filesystem checks */
+    offlineMode: false,
     /** Error patterns to auto-continue on (case-insensitive substrings) */
     errorPatterns: DEFAULT_ERROR_PATTERNS,
     /** Error patterns to NEVER auto-continue on (checked first, case-insensitive substrings) */
@@ -262,6 +288,8 @@ async function loadConfig(directory, log) {
             config.enabled = parsed.enabled;
         if (typeof parsed.updateThrottleMs === "number")
             config.updateThrottleMs = parsed.updateThrottleMs;
+        if (typeof parsed.offlineMode === "boolean")
+            config.offlineMode = parsed.offlineMode;
         if (Array.isArray(parsed.errorPatterns)) {
             config.errorPatterns = parsed.errorPatterns.filter((p) => typeof p === "string");
         }
@@ -330,8 +358,32 @@ const plugin = async ({ client, directory }) => {
     let lastRemoteCheck = 0;
     let cachedRemoteHash = null;
     let cachedCommitSha = null;
-    // Commit SHA for the loaded version — captured when loaded matches remote
+    // Commit SHA for the loaded version — persisted to XDG cache file
     let loadedCommitSha = null;
+    let loadedCommitConfirmed = false; // true = verified via direct hash match with remote
+    let loadedCommitUncertain = false; // true = from file with mismatched hash → show "?"
+    // On-load: try to recover loadedCommitSha from cache file, fall back to remote
+    if (!globalConfig.offlineMode && loadedHash) {
+        try {
+            const cached = await readLoadedCommitFile();
+            if (cached && cached.hash === loadedHash) {
+                loadedCommitSha = cached.commitSha;
+                // Hash-verified from file — reliable but not yet confirmed with remote
+            }
+            else if (cached) {
+                loadedCommitSha = cached.commitSha;
+                loadedCommitUncertain = true; // file hash ≠ loadedHash
+            }
+        }
+        catch { }
+        // If still no commit SHA, do a one-time remote fetch to try to capture it
+        if (!loadedCommitSha) {
+            try {
+                await fetchLatestHash();
+            }
+            catch { }
+        }
+    }
     /** Check whether the cached module has been cleared (by global update in any session) */
     async function isCacheCleared() {
         const { cache } = getOpencodeDirs();
@@ -362,6 +414,9 @@ const plugin = async ({ client, directory }) => {
         return true; // plugin not found or empty → cleared
     }
     async function fetchLatestHash() {
+        if (globalConfig.offlineMode) {
+            return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
+        }
         const cfg = globalConfig;
         const now = Date.now();
         if (now - lastRemoteCheck < cfg.updateThrottleMs) {
@@ -380,9 +435,35 @@ const plugin = async ({ client, directory }) => {
             const commitLine = bodyLines.find((l) => l.startsWith("Commit: "));
             cachedCommitSha = commitLine?.replace("Commit: ", "").trim() ?? null;
             lastRemoteCheck = now;
-            // Remember commit SHA for loaded version when it matches remote
-            if (loadedHash && cachedRemoteHash === loadedHash && cachedCommitSha && !loadedCommitSha) {
+            // Loaded commit SHA tracking — persist to cache file
+            if (loadedHash && cachedRemoteHash === loadedHash && cachedCommitSha) {
+                // Direct match — confirmed
                 loadedCommitSha = cachedCommitSha;
+                loadedCommitConfirmed = true;
+                loadedCommitUncertain = false;
+                writeLoadedCommitFile(loadedHash, cachedCommitSha).catch(() => { });
+            }
+            else if (loadedHash && cachedRemoteHash !== loadedHash && !loadedCommitConfirmed) {
+                // Hashes don't match and not previously confirmed — re-read file each time
+                // (may have been cleared by global update in another session)
+                try {
+                    const cached = await readLoadedCommitFile();
+                    if (cached && cached.hash === loadedHash) {
+                        loadedCommitSha = cached.commitSha;
+                        loadedCommitUncertain = false;
+                    }
+                    else if (cached) {
+                        loadedCommitSha = cached.commitSha;
+                        loadedCommitUncertain = true; // file hash ≠ loadedHash
+                    }
+                    else {
+                        loadedCommitSha = null;
+                        loadedCommitUncertain = false;
+                    }
+                }
+                catch {
+                    // Don't clear existing value on read failure
+                }
             }
         }
         catch {
@@ -391,6 +472,21 @@ const plugin = async ({ client, directory }) => {
         return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
     }
     // Version info for display
+    function formatLoadedCommitSuffix(remoteCommitSha) {
+        if (!loadedCommitSha)
+            return " (commit: unknown)";
+        const short = loadedCommitSha.substring(0, 7);
+        // Same commit SHA but different content hashes → commit unreliable
+        if (remoteCommitSha && loadedCommitSha === remoteCommitSha
+            && loadedHash && cachedRemoteHash && loadedHash !== cachedRemoteHash) {
+            return " (commit: unknown)";
+        }
+        if (loadedCommitConfirmed)
+            return ` (commit: ${short})`;
+        if (loadedCommitUncertain)
+            return ` (commit: ${short}?)`;
+        return ` (commit: ${short})`;
+    }
     async function versionInfo(checkRemote = false) {
         const loadedShort = loadedHash ? shortHash(loadedHash) : "unknown";
         const currentHash = await readInstalledHash();
@@ -403,9 +499,8 @@ const plugin = async ({ client, directory }) => {
             const { hash: remoteHash, commitSha } = await fetchLatestHash();
             const remoteShort = remoteHash ? shortHash(remoteHash) : null;
             const shortSha = commitSha?.substring(0, 7) ?? "";
-            const loadedSha = loadedCommitSha?.substring(0, 7) ?? "";
             const remoteCommitSuffix = shortSha ? ` (commit: ${shortSha})` : "";
-            const loadedCommitSuffix = loadedSha ? ` (commit: ${loadedSha})` : "";
+            const loadedCSuffix = formatLoadedCommitSuffix(commitSha);
             if (remoteHash && remoteShort) {
                 const matchesLoaded = loadedHash === remoteHash;
                 const matchesCurrent = currentHash === remoteHash;
@@ -415,7 +510,7 @@ const plugin = async ({ client, directory }) => {
                     lines.push(`${loadedShort}${remoteCommitSuffix}`);
                 }
                 else {
-                    lines.push(`${loadedShort}${loadedCommitSuffix}`);
+                    lines.push(`${loadedShort}${loadedCSuffix}`);
                 }
                 if (localUpdated) {
                     lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
@@ -426,11 +521,11 @@ const plugin = async ({ client, directory }) => {
                 else if (!localUpdated && !matchesLoaded) {
                     // loaded == current, remote is different → update available
                     if (cacheCleared) {
-                        lines.push(`  🆕 Update ready: ${loadedShort}${loadedCommitSuffix} → ${remoteShort}${remoteCommitSuffix}`);
+                        lines.push(`  🆕 Update ready: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
                         lines.push(`     Restart opencode to load the new version`);
                     }
                     else {
-                        lines.push(`  🆕 Update available: ${loadedShort}${loadedCommitSuffix} → ${remoteShort}${remoteCommitSuffix}`);
+                        lines.push(`  🆕 Update available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
                         lines.push(`     Run /ac global update then restart opencode`);
                     }
                 }
@@ -440,20 +535,21 @@ const plugin = async ({ client, directory }) => {
                 else if (localUpdated && !matchesCurrent && !matchesLoaded) {
                     // All three differ: loaded ≠ current ≠ remote
                     if (cacheCleared) {
-                        lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCommitSuffix} → ${remoteShort}${remoteCommitSuffix}`);
+                        lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
                         lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
                         lines.push(`     Restart opencode to load the new version`);
                     }
                     else {
-                        lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCommitSuffix} → ${remoteShort}${remoteCommitSuffix}`);
+                        lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
                         lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
                         lines.push(`     Run /ac global update then restart opencode`);
                     }
                 }
             }
             else {
-                // Remote fetch failed or no remote hash — show base version without commit
-                lines.push(loadedShort);
+                // Remote fetch failed or no remote hash — show base version with loaded commit if available
+                const fallbackSuffix = formatLoadedCommitSuffix(null);
+                lines.push(`${loadedShort}${fallbackSuffix !== " (commit: unknown)" ? fallbackSuffix : ""}`);
                 if (localUpdated) {
                     lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
                 }
@@ -498,6 +594,9 @@ const plugin = async ({ client, directory }) => {
             enabled: globalConfig.enabled,
             updateThrottleMs: globalConfig.updateThrottleMs,
         };
+        if (globalConfig.offlineMode) {
+            toWrite.offlineMode = true;
+        }
         if (globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS) {
             toWrite.errorPatterns = globalConfig.errorPatterns;
         }
@@ -603,7 +702,7 @@ const plugin = async ({ client, directory }) => {
             "",
             ...(await configSummaryLines(sessionID, true)),
         ];
-        lines.push("", "  /auto-continue on|off              Enable/disable (session)", "  /auto-continue throttle <ms>         Set retry throttle (session)", "  /auto-continue delay <ms>          Set delay (session)", "  /auto-continue max <n>             Set max retries (session, 0=unlimited)", "  /auto-continue update-throttle <ms>  Set update throttle (session)", "  /auto-continue status              Show current settings", "  /auto-continue patterns            Show active error patterns", "  /auto-continue reload              Reload global config from disk", "  /auto-continue reset               Clear session overrides", "  /auto-continue global <cmd>        Persist setting to config file", "  /auto-continue global update       Clear cache to fetch latest version", "  /auto-continue help                Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
+        lines.push("", "  /auto-continue on|off              Enable/disable (session)", "  /auto-continue throttle <ms>         Set retry throttle (session)", "  /auto-continue delay <ms>          Set delay (session)", "  /auto-continue max <n>             Set max retries (session, 0=unlimited)", "  /auto-continue update-throttle <ms>  Set update throttle (session)", "  /auto-continue status              Show current settings", "  /auto-continue patterns            Show active error patterns", "  /auto-continue reload              Reload global config from disk", "  /auto-continue reset               Clear session overrides", "  /auto-continue global <cmd>        Persist setting to config file", "  /auto-continue global update       Clear cache to fetch latest version", "  /auto-continue global offline on|off  Disable all remote/version checks", "  /auto-continue help                Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
         return lines.join("\n");
     }
     async function statusText(sessionID) {
@@ -618,6 +717,7 @@ const plugin = async ({ client, directory }) => {
             "",
             `  Version:         ${ver}`,
             `  Enabled:         ${cfg.enabled ? "✅ yes" : "❌ no"}`,
+            `  Offline mode:    ${globalConfig.offlineMode ? "✅ on" : "❌ off"}`,
             `  Throttle:        ${cfg.throttleMs}ms`,
             `  Delay:           ${cfg.delayMs}ms`,
             `  Max Retries:     ${cfg.maxConsecutive === 0 ? "unlimited (0)" : cfg.maxConsecutive}`,
@@ -769,33 +869,38 @@ const plugin = async ({ client, directory }) => {
             if (globalSub === "update") {
                 try {
                     await sendMessage(sessionID, "Checking for updates and cleaning all regenerable files...");
-                    // 1. Fetch latest release metadata
+                    // 1. Fetch latest release metadata (skipped in offline mode)
                     let remoteHash = null;
                     let shortSha = "unknown";
                     let remoteShort = "unknown";
-                    try {
-                        const response = await fetch(GITHUB_API_RELEASE, {
-                            headers: { "User-Agent": PLUGIN_NAME },
-                        });
-                        if (response.ok) {
-                            const release = (await response.json());
-                            const body = release.body || "";
-                            const bodyLines = body.split("\n");
-                            remoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
-                            const commitLine = bodyLines.find((l) => l.startsWith("Commit: "));
-                            const commitSha = commitLine?.replace("Commit: ", "").trim();
-                            shortSha = commitSha?.substring(0, 7) ?? "unknown";
-                            remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
-                            cachedRemoteHash = remoteHash;
-                            cachedCommitSha = commitSha ?? null;
-                            lastRemoteCheck = Date.now();
-                            if (loadedHash && remoteHash === loadedHash && commitSha && !loadedCommitSha) {
-                                loadedCommitSha = commitSha;
+                    if (!globalConfig.offlineMode) {
+                        try {
+                            const response = await fetch(GITHUB_API_RELEASE, {
+                                headers: { "User-Agent": PLUGIN_NAME },
+                            });
+                            if (response.ok) {
+                                const release = (await response.json());
+                                const body = release.body || "";
+                                const bodyLines = body.split("\n");
+                                remoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
+                                const commitLine = bodyLines.find((l) => l.startsWith("Commit: "));
+                                const commitSha = commitLine?.replace("Commit: ", "").trim();
+                                shortSha = commitSha?.substring(0, 7) ?? "unknown";
+                                remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
+                                cachedRemoteHash = remoteHash;
+                                cachedCommitSha = commitSha ?? null;
+                                lastRemoteCheck = Date.now();
+                                if (loadedHash && remoteHash === loadedHash && commitSha) {
+                                    loadedCommitSha = commitSha;
+                                    loadedCommitConfirmed = true;
+                                    loadedCommitUncertain = false;
+                                    // Don't write file here — cache dir is about to be wiped
+                                }
                             }
                         }
-                    }
-                    catch {
-                        // Network failure — continue with cleanup anyway
+                        catch {
+                            // Network failure — continue with cleanup anyway
+                        }
                     }
                     const currentShort = loadedHash ? shortHash(loadedHash) : "unknown";
                     const isUpToDate = loadedHash && remoteHash && loadedHash === remoteHash;
@@ -846,13 +951,12 @@ const plugin = async ({ client, directory }) => {
                     // f. npm/arborist cache
                     await tryRm(getNpmCacheDir(), { recursive: true, label: "npm cache" });
                     // 3. Report results
-                    const loadedSha = loadedCommitSha?.substring(0, 7) ?? "";
-                    const loadedSuffix = loadedSha ? ` (commit: ${loadedSha})` : "";
+                    const loadedCSuffix = formatLoadedCommitSuffix(cachedCommitSha);
                     const remoteSuffix = shortSha !== "unknown" ? ` (commit: ${shortSha})` : "";
                     const versionLine = isUpToDate
                         ? `✅ Already up to date: ${currentShort}${remoteSuffix}`
                         : remoteHash
-                            ? `🆕 Update available: ${currentShort}${loadedSuffix} → ${remoteShort}${remoteSuffix}`
+                            ? `🆕 Update available: ${currentShort}${loadedCSuffix} → ${remoteShort}${remoteSuffix}`
                             : `⚠️  Could not check remote version (loaded: ${currentShort})`;
                     const msg = [
                         versionLine,
@@ -880,6 +984,17 @@ const plugin = async ({ client, directory }) => {
                 globalConfig.enabled = globalSub === "on";
                 await writeGlobalConfig();
                 await sendMessage(sessionID, `Global config: auto-continue ${globalSub === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`);
+                throw new Error("__AUTO_CONTINUE_HANDLED__");
+            }
+            if (globalSub === "offline") {
+                const val = args[2]?.toLowerCase();
+                if (val !== "on" && val !== "off") {
+                    await sendMessage(sessionID, "❌ Usage: /auto-continue global offline on|off");
+                    throw new Error("__AUTO_CONTINUE_HANDLED__");
+                }
+                globalConfig.offlineMode = val === "on";
+                await writeGlobalConfig();
+                await sendMessage(sessionID, `Global config: offline mode ${val === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`);
                 throw new Error("__AUTO_CONTINUE_HANDLED__");
             }
             if (globalSub === "throttle" || globalSub === "delay" || globalSub === "max" || globalSub === "update-throttle") {
@@ -917,6 +1032,7 @@ const plugin = async ({ client, directory }) => {
                 "  max <n>             Set global max retries (0=unlimited)",
                 "  update-throttle <ms> Set global update throttle",
                 "  update              Clear cache to fetch latest version",
+                "  offline on|off      Disable all remote/version checks",
             ].join("\n");
             await sendMessage(sessionID, text);
             throw new Error("__AUTO_CONTINUE_HANDLED__");
