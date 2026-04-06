@@ -1,0 +1,275 @@
+name: Build plugin
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+    inputs:
+      upgrade:
+        description: "Run bun upgrade on dependencies before building"
+        type: boolean
+        default: false
+      pull_request:
+        description: "Create a PR instead of committing directly to the branch"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+# Only one build at a time per branch
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Prefer GH_TOKEN secret (allows triggering downstream workflows like tag-latest)
+      # Fall back to GITHUB_TOKEN (won't trigger other workflows)
+      TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+      COMMIT_PREFIX: "build: "
+
+    steps:
+      # ── 1. Skip check: bail if the triggering commit is from this workflow ──
+      - name: Check if previous commit is from this workflow
+        id: skip_check
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+        run: |
+          COMMIT_MSG=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }} --jq '.commit.message' 2>/dev/null || echo "")
+          if [[ "$COMMIT_MSG" == "${COMMIT_PREFIX}"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping build — previous commit was from this workflow: ${COMMIT_MSG%%$'\n'*}"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Exit early if skip
+        if: steps.skip_check.outputs.skip == 'true'
+        run: |
+          echo "## Skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "Previous commit was from this workflow. Nothing to do." >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 2. Checkout and setup ──
+      - uses: actions/checkout@v4
+        if: steps.skip_check.outputs.skip != 'true'
+        with:
+          token: ${{ env.TOKEN }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.skip_check.outputs.skip != 'true'
+        with:
+          bun-version: latest
+
+      # ── 3. Install dependencies ──
+      - name: Install dependencies
+        if: steps.skip_check.outputs.skip != 'true'
+        run: bun install --frozen-lockfile 2>/dev/null || bun install
+
+      # ── 4. Optional: upgrade dependencies ──
+      - name: Upgrade dependencies
+        if: steps.skip_check.outputs.skip != 'true' && github.event_name == 'workflow_dispatch' && github.event.inputs.upgrade == 'true'
+        run: |
+          echo "Upgrading dependencies..."
+          bun update
+          echo "upgrade_ran=true" >> "$GITHUB_ENV"
+
+      # ── 5. Build ──
+      - name: Build
+        if: steps.skip_check.outputs.skip != 'true'
+        run: bunx tsc
+
+      # ── 6. Detect changes ──
+      - name: Detect changes
+        if: steps.skip_check.outputs.skip != 'true'
+        id: changes
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "diff_summary=No changes detected." >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+            # Build a human-readable summary of changed files
+            STAT=$(git diff --cached --stat)
+            SHORTSTAT=$(git diff --cached --shortstat)
+            FILES=$(git diff --cached --name-only)
+            DIFF_NAMES=$(git diff --cached --diff-filter=M --name-only | tr '\n' ', ' | sed 's/,$//')
+
+            echo "diff_stat<<DIFFEOF" >> "$GITHUB_OUTPUT"
+            echo "$STAT" >> "$GITHUB_OUTPUT"
+            echo "DIFFEOF" >> "$GITHUB_OUTPUT"
+
+            echo "diff_shortstat=$SHORTSTAT" >> "$GITHUB_OUTPUT"
+            echo "diff_names=$DIFF_NAMES" >> "$GITHUB_OUTPUT"
+
+            # Build commit message body
+            {
+              echo "commit_body<<BODYEOF"
+              if [ "${upgrade_ran:-}" = "true" ]; then
+                echo ""
+                echo "Dependencies upgraded via bun update."
+              fi
+              echo ""
+              echo "Changed files:"
+              echo "$FILES" | sed 's/^/  /'
+              echo ""
+              echo "$SHORTSTAT"
+              echo "BODYEOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 7a. Commit directly (default) ──
+      - name: Commit and push
+        if: >-
+          steps.skip_check.outputs.skip != 'true'
+          && steps.changes.outputs.has_changes == 'true'
+          && (github.event_name != 'workflow_dispatch' || github.event.inputs.pull_request != 'true')
+        id: push
+        env:
+          GH_TOKEN: ${{ env.TOKEN }}
+          COMMIT_BODY: ${{ steps.changes.outputs.commit_body }}
+          DIFF_SHORTSTAT: ${{ steps.changes.outputs.diff_shortstat }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+
+          # Write commit message to file to avoid quoting issues with multiline content
+          {
+            printf '%s\n' "${COMMIT_PREFIX}rebuild dist (${DIFF_SHORTSTAT})"
+            printf '%s\n' "${COMMIT_BODY}"
+          } > /tmp/commit-msg.txt
+          git commit -F /tmp/commit-msg.txt
+
+          # Attempt to push; handle conflicts
+          PUSH_OK=false
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${BRANCH}" 2>&1; then
+              PUSH_OK=true
+              echo "push_result=success" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            echo "Push attempt $attempt failed, pulling and retrying..."
+            git pull --rebase origin "$BRANCH" || true
+            sleep 2
+          done
+
+          if [ "$PUSH_OK" != "true" ]; then
+            echo "push_result=failed" >> "$GITHUB_OUTPUT"
+            echo "::error::Push failed after 3 attempts — cancelling workflow"
+
+            # Try to cancel this workflow run
+            RUN_ID="${{ github.run_id }}"
+            gh api repos/${{ github.repository }}/actions/runs/${RUN_ID}/cancel -X POST 2>/dev/null || true
+
+            # Sleep up to 30s waiting for cancellation to take effect
+            WAITED=0
+            while [ "$WAITED" -lt 30 ]; do
+              sleep 2
+              WAITED=$((WAITED + 2))
+              STATUS=$(gh api repos/${{ github.repository }}/actions/runs/${RUN_ID} --jq '.status' 2>/dev/null || echo "unknown")
+              if [ "$STATUS" = "completed" ] || [ "$STATUS" = "cancelled" ]; then
+                echo "Workflow cancelled after ${WAITED}s"
+                exit 0
+              fi
+            done
+
+            echo "::error::Cancel did not take effect within 30s"
+            exit 1
+          fi
+
+      # ── 7b. Create PR instead (workflow_dispatch + pull_request flag) ──
+      - name: Create pull request
+        if: >-
+          steps.skip_check.outputs.skip != 'true'
+          && steps.changes.outputs.has_changes == 'true'
+          && github.event_name == 'workflow_dispatch'
+          && github.event.inputs.pull_request == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ env.TOKEN }}
+          COMMIT_BODY: ${{ steps.changes.outputs.commit_body }}
+          DIFF_SHORTSTAT: ${{ steps.changes.outputs.diff_shortstat }}
+          DIFF_STAT: ${{ steps.changes.outputs.diff_stat }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          PR_BRANCH="build/${BRANCH}-$(date -u +%Y%m%dT%H%M%SZ)"
+          SUBJECT="${COMMIT_PREFIX}rebuild dist (${DIFF_SHORTSTAT})"
+
+          # Write commit message to file
+          {
+            printf '%s\n' "$SUBJECT"
+            printf '%s\n' "${COMMIT_BODY}"
+          } > /tmp/commit-msg.txt
+
+          git checkout -b "$PR_BRANCH"
+          git commit -F /tmp/commit-msg.txt
+          git push -u origin "$PR_BRANCH"
+
+          # Write PR body to file
+          {
+            echo "## Build Output Changes"
+            echo ""
+            echo '```'
+            echo "${DIFF_STAT}"
+            echo '```'
+            echo ""
+            echo "---"
+            echo "Triggered by workflow_dispatch on \`${BRANCH}\`."
+          } > /tmp/pr-body.md
+
+          PR_URL=$(gh pr create \
+            --base "$BRANCH" \
+            --head "$PR_BRANCH" \
+            --title "$SUBJECT" \
+            --body-file /tmp/pr-body.md)
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "Created PR: $PR_URL"
+
+      # ── 8. Job summary ──
+      - name: Write job summary
+        if: steps.skip_check.outputs.skip != 'true'
+        env:
+          HAS_CHANGES: ${{ steps.changes.outputs.has_changes }}
+          DIFF_STAT: ${{ steps.changes.outputs.diff_stat }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          PUSH_RESULT: ${{ steps.push.outputs.push_result }}
+        run: |
+          {
+            echo "## Build Plugin"
+            echo ""
+
+            if [ "$HAS_CHANGES" != "true" ]; then
+              echo "**No changes.** Build output is already up to date."
+            elif [ -n "$PR_URL" ]; then
+              echo "**PR created:** ${PR_URL}"
+              echo ""
+              echo '```'
+              echo "${DIFF_STAT}"
+              echo '```'
+            elif [ "$PUSH_RESULT" = "success" ]; then
+              echo "**Committed and pushed** to \`${GITHUB_REF#refs/heads/}\`."
+              echo ""
+              echo '```'
+              echo "${DIFF_STAT}"
+              echo '```'
+            elif [ "$PUSH_RESULT" = "failed" ]; then
+              echo ":x: **Push failed** — conflict could not be resolved."
+            fi
+
+            if [ "${upgrade_ran:-}" = "true" ]; then
+              echo ""
+              echo "> Dependencies were upgraded via \`bun update\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
