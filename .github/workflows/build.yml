@@ -149,24 +149,16 @@ jobs:
           } > /tmp/commit-msg.txt
           git commit -F /tmp/commit-msg.txt
 
-          # Attempt to push; handle conflicts
-          PUSH_OK=false
-          for attempt in 1 2 3; do
-            if git push origin "HEAD:${BRANCH}" 2>&1; then
-              PUSH_OK=true
-              echo "push_result=success" >> "$GITHUB_OUTPUT"
-              break
-            fi
-            echo "Push attempt $attempt failed, pulling and retrying..."
-            git pull --rebase origin "$BRANCH" || true
-            sleep 2
-          done
-
-          if [ "$PUSH_OK" != "true" ]; then
+          # Push once — if it fails, another commit landed and a new workflow
+          # run will handle building that. No rebase: that would change the
+          # commit and require regenerating the build, causing a loop.
+          if git push origin "HEAD:${BRANCH}" 2>&1; then
+            echo "push_result=success" >> "$GITHUB_OUTPUT"
+          else
             echo "push_result=failed" >> "$GITHUB_OUTPUT"
-            echo "::error::Push failed after 3 attempts — cancelling workflow"
+            echo "::warning::Push failed (branch moved) — a new workflow run will rebuild"
 
-            # Try to cancel this workflow run
+            # Try to cancel this workflow run so it shows as cancelled, not failed
             RUN_ID="${{ github.run_id }}"
             gh api repos/${{ github.repository }}/actions/runs/${RUN_ID}/cancel -X POST 2>/dev/null || true
 
