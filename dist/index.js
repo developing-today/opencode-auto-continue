@@ -1,4 +1,4 @@
-import { access, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_DIR = ".opencode";
@@ -774,8 +774,11 @@ const plugin = async ({ client, directory }) => {
                     async function tryRm(target, opts) {
                         try {
                             await access(target);
+                            const resolved = await realpath(target).catch(() => target);
+                            const stats = await lstat(target).catch(() => null);
+                            const isDir = stats?.isDirectory() ?? !!opts?.recursive;
                             await rm(target, { force: true, recursive: opts?.recursive });
-                            cleaned.push(opts?.label || target);
+                            cleaned.push({ label: opts?.label || target, realPath: resolved, isDir });
                         }
                         catch {
                             // doesn't exist or can't remove — not critical
@@ -807,7 +810,7 @@ const plugin = async ({ client, directory }) => {
                     catch { }
                     // e. Bun caches (platform-aware: macOS ~/Library/Caches/bun, Linux ~/.cache/.bun, etc.)
                     for (const dir of getBunCacheDirs()) {
-                        await tryRm(dir, { recursive: true, label: `bun cache: ${dir}` });
+                        await tryRm(dir, { recursive: true, label: "bun cache" });
                     }
                     // f. npm/arborist cache
                     await tryRm(getNpmCacheDir(), { recursive: true, label: "npm cache" });
@@ -823,7 +826,10 @@ const plugin = async ({ client, directory }) => {
                         cleaned.length > 0
                             ? `Cleaned ${cleaned.length} items:`
                             : "Nothing to clean (already clean).",
-                        ...cleaned.map(c => `  • ${c}`),
+                        ...cleaned.flatMap(c => [
+                            `  • ${c.label}`,
+                            `    ↳ ${c.realPath}${c.isDir ? "/" : ""}`,
+                        ]),
                         "",
                         "Restart opencode to reinstall plugins fresh.",
                     ];
