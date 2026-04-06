@@ -455,10 +455,10 @@ const plugin: Plugin = async ({ client, directory }) => {
         } else if (!localUpdated && !matchesLoaded) {
           // loaded == current, remote is different → update available
           if (cacheCleared) {
-            lines.push(`  🆕 Update ready: ${remoteShort}${commitSuffix}`);
+            lines.push(`  🆕 Update ready: ${loadedShort} → ${remoteShort}${commitSuffix}`);
             lines.push(`     Restart opencode to load the new version`);
           } else {
-            lines.push(`  🆕 Update available: ${remoteShort}${commitSuffix}`);
+            lines.push(`  🆕 Update available: ${loadedShort} → ${remoteShort}${commitSuffix}`);
             lines.push(`     Run /ac global update then restart opencode`);
           }
         } else if (localUpdated && matchesCurrent) {
@@ -466,11 +466,11 @@ const plugin: Plugin = async ({ client, directory }) => {
         } else if (localUpdated && !matchesCurrent && !matchesLoaded) {
           // All three differ: loaded ≠ current ≠ remote
           if (cacheCleared) {
-            lines.push(`  🆕 Newer version available: ${remoteShort}${commitSuffix}`);
+            lines.push(`  🆕 Newer version available: ${loadedShort} → ${remoteShort}${commitSuffix}`);
             lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
             lines.push(`     Restart opencode to load the new version`);
           } else {
-            lines.push(`  🆕 Newer version available: ${remoteShort}${commitSuffix}`);
+            lines.push(`  🆕 Newer version available: ${loadedShort} → ${remoteShort}${commitSuffix}`);
             lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
             lines.push(`     Run /ac global update then restart opencode`);
           }
