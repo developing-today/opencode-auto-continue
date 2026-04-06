@@ -13,6 +13,24 @@ on:
         description: "Create a PR instead of committing directly to the branch"
         type: boolean
         default: false
+      tag_latest:
+        description: "Trigger tag-latest workflow after successful build"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      update:
+        description: "Run bun update on dependencies before building"
+        type: boolean
+        default: false
+      pull_request:
+        description: "Create a PR instead of committing directly to the branch"
+        type: boolean
+        default: false
+      tag_latest:
+        description: "Trigger tag-latest workflow after successful build"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -73,7 +91,7 @@ jobs:
 
       # ── 4. Optional: upgrade dependencies ──
       - name: Upgrade dependencies
-        if: steps.skip_check.outputs.skip != 'true' && github.event_name == 'workflow_dispatch' && github.event.inputs.update == 'true'
+        if: steps.skip_check.outputs.skip != 'true' && inputs.update == 'true'
         run: |
           echo "Upgrading dependencies..."
           bun update
@@ -130,7 +148,7 @@ jobs:
         if: >-
           steps.skip_check.outputs.skip != 'true'
           && steps.changes.outputs.has_changes == 'true'
-          && (github.event_name != 'workflow_dispatch' || github.event.inputs.pull_request != 'true')
+          && inputs.pull_request != 'true'
         id: push
         env:
           GH_TOKEN: ${{ env.TOKEN }}
@@ -178,13 +196,25 @@ jobs:
             exit 1
           fi
 
-      # ── 7b. Create PR instead (workflow_dispatch + pull_request flag) ──
+      # ── 7b. Optionally trigger tag-latest ──
+      - name: Trigger tag-latest workflow
+        if: >-
+          steps.push.outputs.push_result == 'success'
+          && inputs.tag_latest == 'true'
+        env:
+          GH_TOKEN: ${{ env.TOKEN }}
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          echo "Triggering tag-latest workflow on ${BRANCH}..."
+          gh workflow run tag-latest.yml --ref "$BRANCH"
+          echo "tag_latest_triggered=true" >> "$GITHUB_ENV"
+
+      # ── 7c. Create PR instead (workflow_dispatch/workflow_call + pull_request flag) ──
       - name: Create pull request
         if: >-
           steps.skip_check.outputs.skip != 'true'
           && steps.changes.outputs.has_changes == 'true'
-          && github.event_name == 'workflow_dispatch'
-          && github.event.inputs.pull_request == 'true'
+          && inputs.pull_request == 'true'
         id: pr
         env:
           GH_TOKEN: ${{ env.TOKEN }}
@@ -263,5 +293,10 @@ jobs:
             if [ "${upgrade_ran:-}" = "true" ]; then
               echo ""
               echo "> Dependencies were upgraded via \`bun update\`."
+            fi
+
+            if [ "${tag_latest_triggered:-}" = "true" ]; then
+              echo ""
+              echo "> Tag-latest workflow was triggered."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
