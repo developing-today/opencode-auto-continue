@@ -1,4 +1,4 @@
-import { access, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
 
@@ -876,13 +876,16 @@ const plugin: Plugin = async ({ client, directory }) => {
 
           // 2. Comprehensive cleanup of all regenerable files (always runs)
           const dirs = getOpencodeDirs();
-          const cleaned: string[] = [];
+          const cleaned: { label: string; realPath: string; isDir: boolean }[] = [];
 
           async function tryRm(target: string, opts?: { recursive?: boolean; label?: string }) {
             try {
               await access(target);
+              const resolved = await realpath(target).catch(() => target);
+              const stats = await lstat(target).catch(() => null);
+              const isDir = stats?.isDirectory() ?? !!opts?.recursive;
               await rm(target, { force: true, recursive: opts?.recursive });
-              cleaned.push(opts?.label || target);
+              cleaned.push({ label: opts?.label || target, realPath: resolved, isDir });
             } catch {
               // doesn't exist or can't remove — not critical
             }
@@ -916,7 +919,7 @@ const plugin: Plugin = async ({ client, directory }) => {
 
           // e. Bun caches (platform-aware: macOS ~/Library/Caches/bun, Linux ~/.cache/.bun, etc.)
           for (const dir of getBunCacheDirs()) {
-            await tryRm(dir, { recursive: true, label: `bun cache: ${dir}` });
+            await tryRm(dir, { recursive: true, label: "bun cache" });
           }
 
           // f. npm/arborist cache
@@ -935,7 +938,10 @@ const plugin: Plugin = async ({ client, directory }) => {
             cleaned.length > 0
               ? `Cleaned ${cleaned.length} items:`
               : "Nothing to clean (already clean).",
-            ...cleaned.map(c => `  • ${c}`),
+            ...cleaned.flatMap(c => [
+              `  • ${c.label}`,
+              `    ↳ ${c.realPath}${c.isDir ? "/" : ""}`,
+            ]),
             "",
             "Restart opencode to reinstall plugins fresh.",
           ];
