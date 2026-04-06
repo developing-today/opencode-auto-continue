@@ -9,29 +9,153 @@ const GITHUB_REPO = "developing-today/opencode-auto-continue";
 const GITHUB_API_COMMITS = `https://api.github.com/repos/${GITHUB_REPO}/commits/main`;
 const GITHUB_API_RELEASE = `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/latest`;
 
-// ─── Content hash from bun.lock ─────────────────────────────────────────────
+// ─── Platform-aware directory resolution ────────────────────────────────────
+// opencode uses xdg-basedir (sindresorhus) for all paths. On both macOS and
+// Linux, this resolves to the standard XDG locations unless overridden by env.
 
-function readContentHashFromLock(raw: string): string | null {
+interface OpencodeDirs {
+  home: string;
+  config: string; // opencode.jsonc, plugin config, SDK deps (package.json, lock files, node_modules)
+  cache: string; // packages/, models.json, bin/, version (CACHE_VERSION guard)
+  data: string; // SQLite DB, auth, logs, snapshots, tool-output, bin/ (LSP servers)
+  state: string; // locks, model.json, prompt-history
+}
+
+function getOpencodeDirs(): OpencodeDirs {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const xdgConfig = process.env.XDG_CONFIG_HOME || join(home, ".config");
+  const xdgCache = process.env.XDG_CACHE_HOME || join(home, ".cache");
+  const xdgData = process.env.XDG_DATA_HOME || join(home, ".local", "share");
+  const xdgState = process.env.XDG_STATE_HOME || join(home, ".local", "state");
+  return {
+    home,
+    config: join(xdgConfig, "opencode"),
+    cache: join(xdgCache, "opencode"),
+    data: join(xdgData, "opencode"),
+    state: join(xdgState, "opencode"),
+  };
+}
+
+/** All platform-specific bun cache directories */
+function getBunCacheDirs(): string[] {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const xdgCache = process.env.XDG_CACHE_HOME || join(home, ".cache");
+  const dirs: string[] = [];
+  // macOS: ~/Library/Caches/bun
+  if (process.platform === "darwin") {
+    dirs.push(join(home, "Library", "Caches", "bun"));
+  }
+  // Linux / XDG: ~/.cache/.bun
+  dirs.push(join(xdgCache, ".bun"));
+  // Older bun versions: ~/.bun/install/cache
+  dirs.push(join(home, ".bun", "install", "cache"));
+  return dirs;
+}
+
+/** npm/arborist cache directory */
+function getNpmCacheDir(): string {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  return process.env.npm_config_cache || join(home, ".npm");
+}
+
+// ─── Content hash from lock files ───────────────────────────────────────────
+
+/** Extract sha512 integrity hash for this plugin from a bun.lock file */
+function readHashFromBunLock(raw: string): string | null {
   const pattern = new RegExp(`"${PLUGIN_NAME}":\\s*\\[.*?,\\s*"(sha512-[^"]+)"`);
   const match = raw.match(pattern);
   return match?.[1] ?? null;
 }
 
+/** Extract integrity hash for this plugin from a package-lock.json (arborist/npm) */
+function readHashFromNpmLock(raw: string): string | null {
+  try {
+    const lock = JSON.parse(raw);
+    const packages: Record<string, { integrity?: string }> = lock.packages || {};
+    for (const [key, val] of Object.entries(packages)) {
+      if (key.includes(PLUGIN_NAME) && val?.integrity) {
+        return val.integrity;
+      }
+    }
+  } catch {}
+  return null;
+}
+
 function shortHash(hash: string): string {
-  // "sha512-+fPJGSdlt..." → first 12 chars after "sha512-"
   const body = hash.startsWith("sha512-") ? hash.slice(7) : hash;
   return body.slice(0, 12);
 }
 
-async function readBunLockHash(): Promise<string | null> {
+/**
+ * Search all possible lock file locations for this plugin's installed hash.
+ *
+ * OpenCode uses @npmcli/arborist (npm) to install plugins into
+ * <xdgCache>/opencode/packages/<sanitized-spec>/, creating package-lock.json.
+ * It also installs SDK deps into <xdgConfig>/opencode/ which may create
+ * bun.lock or package-lock.json. We search all known locations.
+ */
+async function readInstalledHash(): Promise<string | null> {
+  const { config, cache } = getOpencodeDirs();
+
+  // 1. Search cache/packages/ for plugin-specific lock files (arborist installs here)
   try {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const lockPath = join(home, ".cache", "opencode", "bun.lock");
-    const raw = await readFile(lockPath, "utf-8");
-    return readContentHashFromLock(raw);
-  } catch {
-    return null;
+    const packagesDir = join(cache, "packages");
+    const entries = await readdir(packagesDir);
+    for (const entry of entries) {
+      if (!entry.startsWith(PLUGIN_NAME)) continue;
+      const hash = await searchDirForHash(join(packagesDir, entry));
+      if (hash) return hash;
+    }
+  } catch {}
+
+  // 2. Config dir lock files (SDK deps, may contain plugin if installed there)
+  for (const dir of [config, cache]) {
+    for (const { name, reader } of [
+      { name: "package-lock.json", reader: readHashFromNpmLock },
+      { name: "bun.lock", reader: readHashFromBunLock },
+    ]) {
+      try {
+        const raw = await readFile(join(dir, name), "utf-8");
+        const hash = reader(raw);
+        if (hash) return hash;
+      } catch {}
+    }
   }
+
+  return null;
+}
+
+/** Recursively search a directory tree for lock files containing our plugin hash */
+async function searchDirForHash(dir: string, depth = 0): Promise<string | null> {
+  if (depth > 15) return null;
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    // Check lock files in this directory first
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (entry.name === "package-lock.json" || entry.name === ".package-lock.json") {
+        try {
+          const raw = await readFile(join(dir, entry.name), "utf-8");
+          const hash = readHashFromNpmLock(raw);
+          if (hash) return hash;
+        } catch {}
+      }
+      if (entry.name === "bun.lock") {
+        try {
+          const raw = await readFile(join(dir, entry.name), "utf-8");
+          const hash = readHashFromBunLock(raw);
+          if (hash) return hash;
+        } catch {}
+      }
+    }
+    // Recurse into subdirectories (arborist URL specs create nested dirs)
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const hash = await searchDirForHash(join(dir, entry.name), depth + 1);
+      if (hash) return hash;
+    }
+  } catch {}
+  return null;
 }
 
 // ─── Default retryable error patterns ───────────────────────────────────────
@@ -235,7 +359,7 @@ const plugin: Plugin = async ({ client, directory }) => {
   const globalConfig = await loadConfig(directory, log);
 
   // Snapshot content hash at load time
-  const loadedHash = await readBunLockHash();
+  const loadedHash = await readInstalledHash();
   log(`Loaded with content hash: ${loadedHash ?? "unknown"}`);
 
   // Cached remote version check (debounced)
@@ -245,14 +369,28 @@ const plugin: Plugin = async ({ client, directory }) => {
 
   /** Check whether the cached module has been cleared (by global update in any session) */
   async function isCacheCleared(): Promise<boolean> {
+    const { cache } = getOpencodeDirs();
+    // Check if cache dir exists at all
     try {
-      const home = process.env.HOME || process.env.USERPROFILE || "";
-      const cachedMod = join(home, ".cache", "opencode", "node_modules", PLUGIN_NAME);
-      await access(cachedMod);
-      return false; // exists → not cleared
+      await access(cache);
     } catch {
-      return true; // doesn't exist → cleared
+      return true; // entire cache gone → cleared
     }
+    // Check packages dir for our plugin (may be in a nested URL-based path)
+    try {
+      const packagesDir = join(cache, "packages");
+      const entries = await readdir(packagesDir);
+      for (const entry of entries) {
+        if (!entry.startsWith(PLUGIN_NAME)) continue;
+        // Check if this dir has actual content (node_modules with files)
+        try {
+          const nmDir = join(packagesDir, entry, "node_modules");
+          await access(nmDir);
+          return false; // has node_modules → not cleared
+        } catch {}
+      }
+    } catch {}
+    return true; // plugin not found or empty → cleared
   }
 
   async function fetchLatestHash(): Promise<{ hash: string | null; commitSha: string | null }> {
@@ -281,7 +419,7 @@ const plugin: Plugin = async ({ client, directory }) => {
   // Version info for display
   async function versionInfo(checkRemote = false): Promise<string> {
     const loadedShort = loadedHash ? shortHash(loadedHash) : "unknown";
-    const currentHash = await readBunLockHash();
+    const currentHash = await readInstalledHash();
     const currentShort = currentHash ? shortHash(currentHash) : "unknown";
 
     const lines: string[] = [];
@@ -703,100 +841,103 @@ const plugin: Plugin = async ({ client, directory }) => {
     if (subcmd === "global") {
       const globalSub = args[1]?.toLowerCase() || "";
 
-      // ── Global Update: clear cached module so next restart fetches latest ──
+      // ── Global Update: wipe all regenerable files, check for new version ──
       if (globalSub === "update") {
         try {
-          await sendMessage(sessionID, "Checking for updates...");
+          await sendMessage(sessionID, "Checking for updates and cleaning all regenerable files...");
 
-          // 1. Fetch latest release metadata — has both commit SHA and content hash
-          const response = await fetch(GITHUB_API_RELEASE, {
-            headers: { "User-Agent": PLUGIN_NAME },
-          });
-          if (!response.ok) {
-            await sendMessage(sessionID, `❌ GitHub API returned ${response.status}: ${response.statusText}`);
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
+          // 1. Fetch latest release metadata
+          let remoteHash: string | null = null;
+          let shortSha = "unknown";
+          let remoteShort = "unknown";
+          try {
+            const response = await fetch(GITHUB_API_RELEASE, {
+              headers: { "User-Agent": PLUGIN_NAME },
+            });
+            if (response.ok) {
+              const release = (await response.json()) as { body?: string; tag_name?: string };
+              const body = release.body || "";
+              const bodyLines = body.split("\n");
+              remoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
+              const commitLine = bodyLines.find((l: string) => l.startsWith("Commit: "));
+              const commitSha = commitLine?.replace("Commit: ", "").trim();
+              shortSha = commitSha?.substring(0, 7) ?? "unknown";
+              remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
+              cachedRemoteHash = remoteHash;
+              cachedCommitSha = commitSha ?? null;
+              lastRemoteCheck = Date.now();
+            }
+          } catch {
+            // Network failure — continue with cleanup anyway
           }
-          const release = (await response.json()) as { body?: string; tag_name?: string };
-          const body = release.body || "";
-          const bodyLines = body.split("\n");
 
-          // First line is the sha512 SRI hash, "Commit: <sha>" is on a later line
-          const remoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
-          const commitLine = bodyLines.find((l: string) => l.startsWith("Commit: "));
-          const commitSha = commitLine?.replace("Commit: ", "").trim();
-          const shortSha = commitSha?.substring(0, 7) ?? "unknown";
-          const remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
-
-          // Update the shared debounce cache so versionInfo doesn't show stale data
-          cachedRemoteHash = remoteHash;
-          cachedCommitSha = commitSha ?? null;
-          lastRemoteCheck = Date.now();
-
-          // Compare with currently loaded hash
           const currentShort = loadedHash ? shortHash(loadedHash) : "unknown";
           const isUpToDate = loadedHash && remoteHash && loadedHash === remoteHash;
 
-          if (isUpToDate) {
-            await sendMessage(
-              sessionID,
-              [`✅ Already up to date.`, `   Commit: ${shortSha} · Hash: ${currentShort}`].join("\n"),
-            );
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-          }
+          // 2. Comprehensive cleanup of all regenerable files (always runs)
+          const dirs = getOpencodeDirs();
+          const cleaned: string[] = [];
 
-          // 2. Clear OpenCode's cached module and dependency entry so it re-installs on restart
-          const home = process.env.HOME || process.env.USERPROFILE || "";
-          const opencodeCacheDir = join(home, ".cache", "opencode");
-          let cacheCleared = false;
-
-          // Remove the cached node_modules entry
-          try {
-            const cachedMod = join(opencodeCacheDir, "node_modules", PLUGIN_NAME);
-            await rm(cachedMod, { recursive: true, force: true });
-            cacheCleared = true;
-          } catch {
-            // Not critical if missing
-          }
-
-          // Remove from OpenCode's cache package.json so it triggers reinstall
-          try {
-            const pkgJsonPath = join(opencodeCacheDir, "package.json");
-            const raw = await readFile(pkgJsonPath, "utf-8");
-            const parsed = JSON.parse(raw);
-            if (parsed.dependencies?.[PLUGIN_NAME]) {
-              delete parsed.dependencies[PLUGIN_NAME];
-              await writeFile(pkgJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
+          async function tryRm(target: string, opts?: { recursive?: boolean; label?: string }) {
+            try {
+              await access(target);
+              await rm(target, { force: true, recursive: opts?.recursive });
+              cleaned.push(opts?.label || target);
+            } catch {
+              // doesn't exist or can't remove — not critical
             }
-          } catch {
-            // Not critical
           }
 
-          // Remove bun.lock to avoid stale resolution
-          try {
-            await rm(join(opencodeCacheDir, "bun.lock"), { force: true });
-          } catch {
-            // Not critical
-          }
+          // a. Entire opencode cache dir (packages/, models.json, bin/, version)
+          //    This is the same wipe opencode's own CACHE_VERSION guard does on version bumps.
+          await tryRm(dirs.cache, { recursive: true, label: "cache dir (packages, models, version)" });
 
-          // Also clear bun's own install cache
+          // b. Config dir: regenerable package artifacts (NOT config files like opencode.jsonc)
+          for (const name of ["bun.lock", "package.json", "package-lock.json"]) {
+            await tryRm(join(dirs.config, name), { label: `config/${name}` });
+          }
+          await tryRm(join(dirs.config, "node_modules"), { recursive: true, label: "config/node_modules" });
+
+          // c. Data dir: bin/ (LSP servers — re-downloaded on demand)
+          await tryRm(join(dirs.data, "bin"), { recursive: true, label: "data/bin (LSP servers)" });
+
+          // d. Stray package artifacts in data dir subdirectories
           try {
-            const bunCacheDir = join(home, ".cache", ".bun", "install", "cache");
-            const entries = await readdir(bunCacheDir);
-            for (const entry of entries) {
-              if (entry.includes("developing-today-opencode-auto-continue") || entry === PLUGIN_NAME) {
-                await rm(join(bunCacheDir, entry), { recursive: true, force: true });
+            const dataEntries = await readdir(dirs.data, { withFileTypes: true });
+            for (const entry of dataEntries) {
+              if (!entry.isDirectory() || entry.name === "bin") continue;
+              const sub = join(dirs.data, entry.name);
+              for (const name of ["bun.lock", "package.json", "package-lock.json"]) {
+                await tryRm(join(sub, name), { label: `data/${entry.name}/${name}` });
               }
+              await tryRm(join(sub, "node_modules"), { recursive: true, label: `data/${entry.name}/node_modules` });
             }
-          } catch {
-            // Cache dir might not exist — not critical
+          } catch {}
+
+          // e. Bun caches (platform-aware: macOS ~/Library/Caches/bun, Linux ~/.cache/.bun, etc.)
+          for (const dir of getBunCacheDirs()) {
+            await tryRm(dir, { recursive: true, label: `bun cache: ${dir}` });
           }
+
+          // f. npm/arborist cache
+          await tryRm(getNpmCacheDir(), { recursive: true, label: "npm cache" });
+
+          // 3. Report results
+          const versionLine = isUpToDate
+            ? `✅ Already up to date: ${currentShort} (commit: ${shortSha})`
+            : remoteHash
+              ? `🆕 Update available: ${currentShort} → ${remoteShort} (commit: ${shortSha})`
+              : `⚠️  Could not check remote version (loaded: ${currentShort})`;
 
           const msg = [
-            `✅ Update available: ${currentShort} → ${remoteShort}`,
-            `   Commit: ${shortSha}`,
-            cacheCleared ? "   Cleared cached module." : "   No cached module found.",
+            versionLine,
             "",
-            "   Restart opencode to load the new version.",
+            cleaned.length > 0
+              ? `Cleaned ${cleaned.length} items:`
+              : "Nothing to clean (already clean).",
+            ...cleaned.map(c => `  • ${c}`),
+            "",
+            "Restart opencode to reinstall plugins fresh.",
           ];
           await sendMessage(sessionID, msg.join("\n"));
         } catch (err: unknown) {
