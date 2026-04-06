@@ -745,7 +745,8 @@ const plugin: Plugin = async ({ client, directory }) => {
       "  /auto-continue reload              Reload global config from disk",
       "  /auto-continue reset               Clear session overrides",
       "  /auto-continue global <cmd>        Persist setting to config file",
-      "  /auto-continue global update       Clear cache to fetch latest version",
+      "  /auto-continue global update       Clear opencode cache to fetch latest version",
+      "  /auto-continue global update force Clear opencode + system bun/npm caches",
       "  /auto-continue global offline on|off  Disable all remote/version checks",
       "  /auto-continue help                Show this help",
       "",
@@ -962,8 +963,11 @@ const plugin: Plugin = async ({ client, directory }) => {
 
       // ── Global Update: wipe all regenerable files, check for new version ──
       if (globalSub === "update") {
+        const forceMode = args[2]?.toLowerCase() === "force";
         try {
-          await sendMessage(sessionID, "Checking for updates and cleaning all regenerable files...");
+          await sendMessage(sessionID, forceMode
+            ? "Checking for updates and cleaning all regenerable files + system caches..."
+            : "Checking for updates and cleaning opencode regenerable files...");
 
           // 1. Fetch latest release metadata (skipped in offline mode)
           let remoteHash: string | null = null;
@@ -1044,13 +1048,17 @@ const plugin: Plugin = async ({ client, directory }) => {
             }
           } catch {}
 
-          // e. Bun caches (platform-aware: macOS ~/Library/Caches/bun, Linux ~/.cache/.bun, etc.)
-          for (const dir of getBunCacheDirs()) {
-            await tryRm(dir, { recursive: true, label: "bun cache" });
+          // e. Bun caches — system-wide, only with force (affects all bun projects)
+          if (forceMode) {
+            for (const dir of getBunCacheDirs()) {
+              await tryRm(dir, { recursive: true, label: "bun cache" });
+            }
           }
 
-          // f. npm/arborist cache
-          await tryRm(getNpmCacheDir(), { recursive: true, label: "npm cache" });
+          // f. npm/arborist cache — system-wide, only with force (affects all npm projects)
+          if (forceMode) {
+            await tryRm(getNpmCacheDir(), { recursive: true, label: "npm cache" });
+          }
 
           // 3. Report results
           const loadedCSuffix = formatLoadedCommitSuffix(cachedCommitSha);
@@ -1071,9 +1079,11 @@ const plugin: Plugin = async ({ client, directory }) => {
               `  • ${c.label}`,
               `    ↳ ${c.realPath}${c.isDir ? "/" : ""}`,
             ]),
-            "",
-            "Restart opencode to reinstall plugins fresh.",
           ];
+          if (!forceMode) {
+            msg.push("", "  ℹ️  Run /ac global update force to also clear system-wide bun & npm caches");
+          }
+          msg.push("", "Restart opencode to reinstall plugins fresh.");
           await sendMessage(sessionID, msg.join("\n"));
         } catch (err: unknown) {
           if (err instanceof Error && err.message === "__AUTO_CONTINUE_HANDLED__") throw err;
@@ -1145,7 +1155,8 @@ const plugin: Plugin = async ({ client, directory }) => {
         "  delay <ms>          Set global delay",
         "  max <n>             Set global max retries (0=unlimited)",
         "  update-throttle <ms> Set global update throttle",
-        "  update              Clear cache to fetch latest version",
+        "  update              Clear opencode cache to fetch latest version",
+        "  update force        Also clear system-wide bun & npm caches",
         "  offline on|off      Disable all remote/version checks",
       ].join("\n");
       await sendMessage(sessionID, text);
