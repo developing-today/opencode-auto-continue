@@ -5,8 +5,8 @@ on:
     branches: ["**"]
   workflow_dispatch:
     inputs:
-      upgrade:
-        description: "Run bun upgrade on dependencies before building"
+      update:
+        description: "Run bun update on dependencies before building"
         type: boolean
         default: false
       pull_request:
@@ -73,7 +73,7 @@ jobs:
 
       # ── 4. Optional: upgrade dependencies ──
       - name: Upgrade dependencies
-        if: steps.skip_check.outputs.skip != 'true' && github.event_name == 'workflow_dispatch' && github.event.inputs.upgrade == 'true'
+        if: steps.skip_check.outputs.skip != 'true' && github.event_name == 'workflow_dispatch' && github.event.inputs.update == 'true'
         run: |
           echo "Upgrading dependencies..."
           bun update
