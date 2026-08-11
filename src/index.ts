@@ -1,6 +1,13 @@
 import { access, lstat, mkdir, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Plugin } from "@opencode-ai/plugin";
+import {
+  createTurnEvidence,
+  isCompletedEmptyResponse,
+  recordTextPart,
+  updateAssistantEvidence,
+  type TurnEvidence,
+} from "./recovery.js";
 
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_DIR = ".opencode";
@@ -233,6 +240,8 @@ const DEFAULTS: Config = {
   maxConsecutive: 5,
   /** Whether the plugin is enabled */
   enabled: true,
+  /** Retry completed assistant responses that contain no usable output */
+  retryEmptyResponses: true,
   /** Minimum ms between remote version checks */
   updateThrottleMs: 30_000,
   /** Disable all remote calls and version-related filesystem checks */
@@ -248,6 +257,7 @@ interface Config {
   delayMs: number;
   maxConsecutive: number;
   enabled: boolean;
+  retryEmptyResponses: boolean;
   updateThrottleMs: number;
   offlineMode: boolean;
   errorPatterns: string[];
@@ -259,6 +269,8 @@ interface SessionState {
   lastContinueTime: number;
   pendingContinue: boolean;
   consecutiveCount: number;
+  turn: TurnEvidence;
+  idleTimer?: ReturnType<typeof setTimeout>;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -314,6 +326,7 @@ async function loadConfig(directory: string, log: (msg: string) => void): Promis
     if (typeof parsed.delayMs === "number") config.delayMs = parsed.delayMs;
     if (typeof parsed.maxConsecutive === "number") config.maxConsecutive = parsed.maxConsecutive;
     if (typeof parsed.enabled === "boolean") config.enabled = parsed.enabled;
+    if (typeof parsed.retryEmptyResponses === "boolean") config.retryEmptyResponses = parsed.retryEmptyResponses;
     if (typeof parsed.updateThrottleMs === "number") config.updateThrottleMs = parsed.updateThrottleMs;
     if (typeof parsed.offlineMode === "boolean") config.offlineMode = parsed.offlineMode;
     if (Array.isArray(parsed.errorPatterns)) {
@@ -360,6 +373,19 @@ function isRetryableError(error: unknown, config: Config): boolean {
   }
 
   return false;
+}
+
+function isExcludedError(error: unknown, config: Config): boolean {
+  if (!error || typeof error !== "object") return false;
+
+  const err = error as Record<string, unknown>;
+  const data = err.data as Record<string, unknown> | undefined;
+  const name = typeof err.name === "string" ? err.name : "";
+  const message =
+    (typeof data?.message === "string" ? data.message : null) ??
+    (typeof err.message === "string" ? err.message : "");
+  const matchStr = `${name}: ${message}`.toLowerCase();
+  return config.excludePatterns.some((pattern) => matchStr.includes(pattern.toLowerCase()));
 }
 
 function errorMessage(error: unknown): string {
@@ -617,6 +643,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       delayMs: globalConfig.delayMs,
       maxConsecutive: globalConfig.maxConsecutive,
       enabled: globalConfig.enabled,
+      retryEmptyResponses: globalConfig.retryEmptyResponses,
       updateThrottleMs: globalConfig.updateThrottleMs,
     };
     if (globalConfig.offlineMode) {
@@ -641,10 +668,22 @@ const plugin: Plugin = async ({ client, directory }) => {
         lastContinueTime: 0,
         pendingContinue: false,
         consecutiveCount: 0,
+        turn: createTurnEvidence(),
       };
       sessions.set(sessionID, state);
     }
     return state;
+  }
+
+  function clearIdleTimer(state: SessionState) {
+    if (state.idleTimer) clearTimeout(state.idleTimer);
+    state.idleTimer = undefined;
+  }
+
+  function resetTurn(state: SessionState) {
+    clearIdleTimer(state);
+    state.pendingContinue = false;
+    state.turn = createTurnEvidence();
   }
 
   async function sendContinue(sessionID: string) {
@@ -656,7 +695,12 @@ const plugin: Plugin = async ({ client, directory }) => {
 
     if (now - state.lastContinueTime < config.throttleMs) {
       const remaining = config.throttleMs - (now - state.lastContinueTime);
-      log(`Throttle active for session ${sessionID}, ${remaining}ms remaining, skipping`);
+      log(`Throttle active for session ${sessionID}, retrying in ${remaining}ms`);
+      clearIdleTimer(state);
+      state.idleTimer = setTimeout(() => {
+        state.idleTimer = undefined;
+        void sendContinue(sessionID);
+      }, remaining);
       return;
     }
 
@@ -1205,9 +1249,16 @@ const plugin: Plugin = async ({ client, directory }) => {
         const config = getEffectiveConfig(sessionID);
         if (!config.enabled) return;
 
+        const state = getState(sessionID);
+        if (isExcludedError(error, config)) {
+          state.turn.aborted = true;
+          state.pendingContinue = false;
+          clearIdleTimer(state);
+          return;
+        }
+
         if (isRetryableError(error, config)) {
           log(`Retryable error in ${sessionID}: ${errorMessage(error)}`);
-          const state = getState(sessionID);
           state.lastErrorTime = Date.now();
           state.pendingContinue = true;
         }
@@ -1217,32 +1268,95 @@ const plugin: Plugin = async ({ client, directory }) => {
       if (event.type === "message.updated") {
         const props = event.properties as {
           info?: {
+            id?: string;
             sessionID?: string;
             role?: string;
+            finish?: string;
+            tokens?: { output?: number };
             error?: unknown;
             metadata?: { done?: boolean };
           };
         };
         const info = props.info;
-        if (!info?.sessionID || info.role !== "assistant") return;
+        if (!info?.sessionID) return;
+
+        const state = getState(info.sessionID);
+        if (info.role === "user") {
+          resetTurn(state);
+          return;
+        }
+        if (info.role !== "assistant") return;
 
         const config = getEffectiveConfig(info.sessionID);
+        updateAssistantEvidence(state.turn, info);
+
+        if (isExcludedError(info.error, config)) {
+          state.turn.aborted = true;
+          state.pendingContinue = false;
+          clearIdleTimer(state);
+          return;
+        }
 
         // Retryable error on assistant message
         if (config.enabled && isRetryableError(info.error, config)) {
           log(`Retryable error on assistant message in ${info.sessionID}: ${errorMessage(info.error)}`);
-          const state = getState(info.sessionID);
           state.lastErrorTime = Date.now();
           state.pendingContinue = true;
         }
 
         // Reset counter on successful completion
-        if (info.metadata?.done && !info.error) {
-          const state = sessions.get(info.sessionID);
-          if (state && state.consecutiveCount > 0) {
+        if ((info.finish === "stop" || info.metadata?.done) && !info.error) {
+          clearIdleTimer(state);
+          state.pendingContinue = false;
+          if (state.consecutiveCount > 0) {
             log(`${info.sessionID} completed successfully, resetting counter`);
             state.consecutiveCount = 0;
           }
+        }
+      }
+
+      if (event.type === "message.part.updated") {
+        const props = event.properties as {
+          part?: { sessionID?: string; messageID?: string; type?: string; text?: string };
+        };
+        const part = props.part;
+        if (!part?.sessionID) return;
+        recordTextPart(getState(part.sessionID).turn, part);
+      }
+
+      const eventType = event.type as string;
+      if (
+        eventType === "permission.updated" ||
+        eventType === "permission.asked" ||
+        eventType === "permission.v2.asked" ||
+        eventType === "permission.replied" ||
+        eventType === "permission.v2.replied"
+      ) {
+        const props = event.properties as { sessionID?: string };
+        if (!props.sessionID) return;
+        const state = getState(props.sessionID);
+        state.turn.waitingForPermission = !eventType.endsWith("replied");
+        if (state.turn.waitingForPermission) {
+          state.pendingContinue = false;
+          clearIdleTimer(state);
+        }
+      }
+
+      if (
+        eventType === "question.asked" ||
+        eventType === "question.v2.asked" ||
+        eventType === "question.replied" ||
+        eventType === "question.v2.replied" ||
+        eventType === "question.rejected" ||
+        eventType === "question.v2.rejected"
+      ) {
+        const props = event.properties as { sessionID?: string };
+        if (!props.sessionID) return;
+        const state = getState(props.sessionID);
+        state.turn.waitingForQuestion = eventType.endsWith("asked");
+        if (state.turn.waitingForQuestion) {
+          state.pendingContinue = false;
+          clearIdleTimer(state);
         }
       }
 
@@ -1256,11 +1370,35 @@ const plugin: Plugin = async ({ client, directory }) => {
         if (!config.enabled) return;
 
         const state = sessions.get(sessionID);
-        if (state?.pendingContinue) {
-          log(`${sessionID} idle with pending continue, waiting ${config.delayMs}ms...`);
-          setTimeout(() => sendContinue(sessionID), config.delayMs);
-        }
+        if (!state || state.idleTimer) return;
+        if (state.turn.aborted || state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
+        if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
+
+        log(`${sessionID} idle with pending continue, waiting ${config.delayMs}ms...`);
+        state.idleTimer = setTimeout(() => {
+          state.idleTimer = undefined;
+          if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
+          state.pendingContinue = true;
+          void sendContinue(sessionID);
+        }, config.delayMs);
       }
+    },
+
+    "tool.execute.before": async (input: { sessionID?: string; tool?: string }) => {
+      if (input.tool !== "question" || !input.sessionID) return;
+      const state = getState(input.sessionID);
+      state.turn.waitingForQuestion = true;
+      state.pendingContinue = false;
+      clearIdleTimer(state);
+    },
+
+    "tool.execute.after": async (input: { sessionID?: string; tool?: string }) => {
+      if (input.tool !== "question" || !input.sessionID) return;
+      getState(input.sessionID).turn.waitingForQuestion = false;
+    },
+
+    dispose: async () => {
+      for (const state of sessions.values()) clearIdleTimer(state);
     },
   };
 };
