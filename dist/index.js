@@ -1253,6 +1253,14 @@ const plugin = async ({ client, directory }) => {
                         state.consecutiveCount = 0;
                     }
                 }
+                // Some OpenCode versions persist an empty completed response without
+                // emitting session.idle or session.status=idle. Reuse the same guarded
+                // recovery path so the status plugin and auto-continue agree.
+                if (info.finish === "unknown" &&
+                    config.retryEmptyResponses &&
+                    isCompletedEmptyResponse(state.turn)) {
+                    handleSessionIdle(info.sessionID);
+                }
             }
             if (event.type === "message.part.updated") {
                 const props = event.properties;

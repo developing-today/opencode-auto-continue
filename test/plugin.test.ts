@@ -77,6 +77,15 @@ describe("empty response recovery", () => {
     expect(prompts).toHaveLength(1);
   });
 
+  test("continues an empty response when no idle event is emitted", async () => {
+    const { event, prompts, settle } = await createHarness();
+    await userTurn(event);
+    await emptyAssistant(event);
+    await settle();
+
+    expect(prompts).toHaveLength(1);
+  });
+
   test("allows empty response recovery to be disabled", async () => {
     const { event, prompts, settle } = await createHarness({ retryEmptyResponses: false });
     await userTurn(event);
