@@ -20,10 +20,15 @@ async function createHarness(overrides: Record<string, unknown> = {}) {
   );
 
   const prompts: unknown[] = [];
+  const aborts: unknown[] = [];
   const hooks = await plugin({
     directory,
     client: {
       session: {
+        abort: async (request: unknown) => {
+          aborts.push(request);
+          return { data: true };
+        },
         promptAsync: async (request: unknown) => {
           prompts.push(request);
           return {};
@@ -37,7 +42,7 @@ async function createHarness(overrides: Record<string, unknown> = {}) {
   };
   const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
 
-  return { hooks, event, prompts, settle };
+  return { hooks, event, prompts, aborts, settle };
 }
 
 async function userTurn(event: (type: string, properties: Record<string, unknown>) => Promise<void>) {
@@ -268,5 +273,90 @@ describe("empty response recovery", () => {
     await settle();
 
     expect(prompts).toHaveLength(2);
+  });
+});
+
+describe("stalled request recovery", () => {
+  test("aborts a busy request without assistant activity and continues after idle", async () => {
+    const { event, prompts, aborts, settle } = await createHarness({ stalledRequestTimeoutMs: 15 });
+    await userTurn(event);
+    await event("session.status", { sessionID: "session-1", status: { type: "busy" } });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(aborts).toHaveLength(1);
+    expect(prompts).toHaveLength(0);
+
+    await event("session.error", {
+      sessionID: "session-1",
+      error: { name: "MessageAbortedError", message: "operation was aborted" },
+    });
+    await event("session.status", { sessionID: "session-1", status: { type: "idle" } });
+    await settle();
+
+    expect(prompts).toHaveLength(1);
+  });
+
+  test("does not restart the watchdog on duplicate busy events", async () => {
+    const { event, aborts } = await createHarness({ stalledRequestTimeoutMs: 20 });
+    await userTurn(event);
+    await event("session.status", { sessionID: "session-1", status: { type: "busy" } });
+    await new Promise((resolve) => setTimeout(resolve, 12));
+    await event("session.status", { sessionID: "session-1", status: { type: "busy" } });
+    await new Promise((resolve) => setTimeout(resolve, 12));
+
+    expect(aborts).toHaveLength(1);
+  });
+
+  test("does not abort after real assistant activity", async () => {
+    for (const activity of ["text", "reasoning", "tool", "tokens"] as const) {
+      const { event, aborts } = await createHarness({ stalledRequestTimeoutMs: 15 });
+      await userTurn(event);
+      await event("session.status", { sessionID: "session-1", status: { type: "busy" } });
+      if (activity === "tokens") {
+        await event("message.updated", {
+          info: {
+            id: "assistant-active",
+            sessionID: "session-1",
+            role: "assistant",
+            tokens: { output: 1 },
+          },
+        });
+      } else {
+        await event("message.part.updated", {
+          part: {
+            sessionID: "session-1",
+            messageID: "assistant-active",
+            type: activity,
+            text: activity === "tool" ? undefined : "activity",
+          },
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      expect(aborts).toHaveLength(0);
+    }
+  });
+
+  test("does not abort user-cancelled, question, permission, or disabled watchdog turns", async () => {
+    for (const blocked of ["abort", "question", "permission", "disabled"] as const) {
+      const { hooks, event, aborts } = await createHarness({
+        stalledRequestTimeoutMs: blocked === "disabled" ? 0 : 15,
+      });
+      await userTurn(event);
+      await event("session.status", { sessionID: "session-1", status: { type: "busy" } });
+      if (blocked === "abort") {
+        await event("session.error", {
+          sessionID: "session-1",
+          error: { name: "MessageAbortedError", message: "operation was aborted" },
+        });
+      } else if (blocked === "question") {
+        await hooks["tool.execute.before"]?.({ sessionID: "session-1", tool: "question" } as never, {} as never);
+      } else if (blocked === "permission") {
+        await event("permission.updated", { sessionID: "session-1" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      expect(aborts).toHaveLength(0);
+    }
   });
 });

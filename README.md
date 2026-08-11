@@ -9,8 +9,9 @@ OpenCode plugin that automatically sends "continue" when transient errors or com
 1. **Detects recoverable failures**: Listens for explicit errors and completed assistant messages that end with `finish: "unknown"`, zero output tokens, and no text or error.
 2. **Pattern and state matching**: Matches explicit errors against configurable patterns and strictly validates the latest assistant message before treating an empty response as recoverable. User aborts, tool calls, questions, and permission prompts are excluded.
 3. **Waits for idle**: When the session becomes idle after a recoverable failure, rechecks the latest state after the configured delay and sends "continue" via `promptAsync`.
-4. **Safety limits**: Configurable throttle and max consecutive retries prevent infinite loops
-5. **Auto-reset**: Consecutive retry counter resets when a message completes successfully
+4. **Recovers stalled requests**: Aborts a request that remains busy for 200 seconds without any real assistant activity, then sends "continue" after the session becomes idle.
+5. **Safety limits**: Configurable throttle and max consecutive retries prevent infinite loops
+6. **Auto-reset**: Consecutive retry counter resets when a message completes successfully
 
 ## Installation
 
@@ -89,6 +90,10 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
   // Retry finish="unknown" assistant responses with zero output and no text/error
   "retryEmptyResponses": true,
 
+  // Abort and retry after 200 seconds with no text, reasoning, tool call, or output token
+  // Set to 0 to disable stalled-request recovery
+  "stalledRequestTimeoutMs": 200000,
+
   // Update throttle: minimum ms between remote version checks.
   // The plugin only checks for new versions when you run /ac, /ac status,
   // or /auto-continue — this controls how often that check hits GitHub.
@@ -105,6 +110,7 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
 | `maxConsecutive` | number | `5` | Max consecutive auto-continues before giving up (0 = unlimited) |
 | `enabled` | boolean | `true` | Set `false` to disable without removing from plugin list |
 | `retryEmptyResponses` | boolean | `true` | Retry strict completed empty assistant responses without an explicit error |
+| `stalledRequestTimeoutMs` | number | `200000` | Abort and retry a busy request with no real assistant activity after this delay (0 disables) |
 | `updateThrottleMs` | number | `30000` | Update throttle: minimum ms between remote version checks |
 | `errorPatterns` | string[] | *(see below)* | Error substrings that trigger auto-continue (case-insensitive) |
 | `excludePatterns` | string[] | *(see below)* | Error substrings that **never** trigger auto-continue (checked first) |
@@ -123,6 +129,12 @@ Some providers can finish a request without emitting an explicit error or a usab
 - the session is not waiting for a question answer or permission reply
 
 The existing `delayMs`, `throttleMs`, and `maxConsecutive` limits apply. A late successful `finish: "stop"` event cancels a queued retry, and a successful stop resets the consecutive retry counter. Set `retryEmptyResponses` to `false` to retain error-only behavior.
+
+### Stalled Requests
+
+The plugin starts a watchdog when a session becomes busy. If the request remains busy for `stalledRequestTimeoutMs` without emitting non-empty text, reasoning, a tool call, or any output token, the plugin calls OpenCode's session abort API and sends "continue" after the session becomes idle.
+
+The default timeout is 200 seconds. Once real assistant activity begins, the watchdog is cancelled, so it does not impose a total-duration limit on long responses or tool executions. User-initiated aborts, questions, and permission prompts remain excluded from automatic recovery. Set `stalledRequestTimeoutMs` to `0` to disable this behavior.
 
 ### Error Patterns
 

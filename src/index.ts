@@ -242,6 +242,8 @@ const DEFAULTS: Config = {
   enabled: true,
   /** Retry completed assistant responses that contain no usable output */
   retryEmptyResponses: true,
+  /** Abort and retry a busy request with no assistant activity after this delay (0 disables) */
+  stalledRequestTimeoutMs: 200_000,
   /** Minimum ms between remote version checks */
   updateThrottleMs: 30_000,
   /** Disable all remote calls and version-related filesystem checks */
@@ -258,6 +260,7 @@ interface Config {
   maxConsecutive: number;
   enabled: boolean;
   retryEmptyResponses: boolean;
+  stalledRequestTimeoutMs: number;
   updateThrottleMs: number;
   offlineMode: boolean;
   errorPatterns: string[];
@@ -271,6 +274,10 @@ interface SessionState {
   consecutiveCount: number;
   turn: TurnEvidence;
   idleTimer?: ReturnType<typeof setTimeout>;
+  stalledTimer?: ReturnType<typeof setTimeout>;
+  busy: boolean;
+  pluginAbortPending: boolean;
+  sawAssistantActivity: boolean;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -327,6 +334,9 @@ async function loadConfig(directory: string, log: (msg: string) => void): Promis
     if (typeof parsed.maxConsecutive === "number") config.maxConsecutive = parsed.maxConsecutive;
     if (typeof parsed.enabled === "boolean") config.enabled = parsed.enabled;
     if (typeof parsed.retryEmptyResponses === "boolean") config.retryEmptyResponses = parsed.retryEmptyResponses;
+    if (typeof parsed.stalledRequestTimeoutMs === "number") {
+      config.stalledRequestTimeoutMs = parsed.stalledRequestTimeoutMs;
+    }
     if (typeof parsed.updateThrottleMs === "number") config.updateThrottleMs = parsed.updateThrottleMs;
     if (typeof parsed.offlineMode === "boolean") config.offlineMode = parsed.offlineMode;
     if (Array.isArray(parsed.errorPatterns)) {
@@ -644,6 +654,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       maxConsecutive: globalConfig.maxConsecutive,
       enabled: globalConfig.enabled,
       retryEmptyResponses: globalConfig.retryEmptyResponses,
+      stalledRequestTimeoutMs: globalConfig.stalledRequestTimeoutMs,
       updateThrottleMs: globalConfig.updateThrottleMs,
     };
     if (globalConfig.offlineMode) {
@@ -669,6 +680,9 @@ const plugin: Plugin = async ({ client, directory }) => {
         pendingContinue: false,
         consecutiveCount: 0,
         turn: createTurnEvidence(),
+        busy: false,
+        pluginAbortPending: false,
+        sawAssistantActivity: false,
       };
       sessions.set(sessionID, state);
     }
@@ -680,9 +694,51 @@ const plugin: Plugin = async ({ client, directory }) => {
     state.idleTimer = undefined;
   }
 
+  function clearStalledTimer(state: SessionState) {
+    if (state.stalledTimer) clearTimeout(state.stalledTimer);
+    state.stalledTimer = undefined;
+  }
+
+  function hasAssistantActivity(state: SessionState): boolean {
+    const assistant = state.turn.assistant;
+    return Boolean(
+      state.sawAssistantActivity ||
+        (assistant && (assistant.outputTokens > 0 || assistant.sawText || assistant.finish === "tool-calls")),
+    );
+  }
+
+  function startStalledTimer(sessionID: string, state: SessionState) {
+    const config = getEffectiveConfig(sessionID);
+    if (state.stalledTimer) return;
+    if (!config.enabled || config.stalledRequestTimeoutMs <= 0 || hasAssistantActivity(state)) return;
+    if (state.pluginAbortPending) return;
+    if (state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
+
+    state.stalledTimer = setTimeout(async () => {
+      state.stalledTimer = undefined;
+      const currentConfig = getEffectiveConfig(sessionID);
+      if (!currentConfig.enabled || !state.busy || hasAssistantActivity(state)) return;
+      if (state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
+      if (currentConfig.maxConsecutive > 0 && state.consecutiveCount >= currentConfig.maxConsecutive) return;
+
+      state.pluginAbortPending = true;
+      state.pendingContinue = true;
+      try {
+        await client.session.abort({ path: { id: sessionID } });
+      } catch (err) {
+        state.pluginAbortPending = false;
+        state.pendingContinue = false;
+        log(`Failed to abort stalled request in ${sessionID}: ${err}`);
+      }
+    }, config.stalledRequestTimeoutMs);
+  }
+
   function resetTurn(state: SessionState) {
     clearIdleTimer(state);
+    clearStalledTimer(state);
     state.pendingContinue = false;
+    state.pluginAbortPending = false;
+    state.sawAssistantActivity = false;
     state.turn = createTurnEvidence();
   }
 
@@ -728,6 +784,29 @@ const plugin: Plugin = async ({ client, directory }) => {
     } catch (err) {
       log(`Failed to send "continue" to ${sessionID}: ${err}`);
     }
+  }
+
+  function handleSessionIdle(sessionID: string) {
+    const config = getEffectiveConfig(sessionID);
+    if (!config.enabled) return;
+
+    const state = sessions.get(sessionID);
+    if (!state || state.idleTimer) return;
+    state.busy = false;
+    clearStalledTimer(state);
+    if (state.pluginAbortPending) {
+      state.turn.aborted = false;
+    }
+    if (state.turn.aborted || state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
+    if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
+
+    log(`${sessionID} idle with pending continue, waiting ${config.delayMs}ms...`);
+    state.idleTimer = setTimeout(() => {
+      state.idleTimer = undefined;
+      if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
+      state.pendingContinue = true;
+      void sendContinue(sessionID);
+    }, config.delayMs);
   }
 
   // ── Command UI helpers ──────────────────────────────────────────────────
@@ -815,6 +894,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       `  Throttle:        ${cfg.throttleMs}ms`,
       `  Delay:           ${cfg.delayMs}ms`,
       `  Max Retries:     ${cfg.maxConsecutive === 0 ? "unlimited (0)" : cfg.maxConsecutive}`,
+      `  Stall timeout:   ${cfg.stalledRequestTimeoutMs > 0 ? `${cfg.stalledRequestTimeoutMs}ms` : "disabled"}`,
       `  Update throttle: ${cfg.updateThrottleMs}ms`,
     ];
 
@@ -1251,9 +1331,11 @@ const plugin: Plugin = async ({ client, directory }) => {
 
         const state = getState(sessionID);
         if (isExcludedError(error, config)) {
+          if (state.pluginAbortPending) return;
           state.turn.aborted = true;
           state.pendingContinue = false;
           clearIdleTimer(state);
+          clearStalledTimer(state);
           return;
         }
 
@@ -1289,11 +1371,17 @@ const plugin: Plugin = async ({ client, directory }) => {
 
         const config = getEffectiveConfig(info.sessionID);
         updateAssistantEvidence(state.turn, info);
+        if (hasAssistantActivity(state)) {
+          state.sawAssistantActivity = true;
+          clearStalledTimer(state);
+        }
 
         if (isExcludedError(info.error, config)) {
+          if (state.pluginAbortPending) return;
           state.turn.aborted = true;
           state.pendingContinue = false;
           clearIdleTimer(state);
+          clearStalledTimer(state);
           return;
         }
 
@@ -1307,6 +1395,7 @@ const plugin: Plugin = async ({ client, directory }) => {
         // Reset counter on successful completion
         if ((info.finish === "stop" || info.metadata?.done) && !info.error) {
           clearIdleTimer(state);
+          clearStalledTimer(state);
           state.pendingContinue = false;
           if (state.consecutiveCount > 0) {
             log(`${info.sessionID} completed successfully, resetting counter`);
@@ -1321,10 +1410,31 @@ const plugin: Plugin = async ({ client, directory }) => {
         };
         const part = props.part;
         if (!part?.sessionID) return;
-        recordTextPart(getState(part.sessionID).turn, part);
+        const state = getState(part.sessionID);
+        recordTextPart(state.turn, part);
+        const hasPartActivity =
+          ((part.type === "text" || part.type === "reasoning") && Boolean(part.text?.trim())) || part.type === "tool";
+        if (hasPartActivity) {
+          state.sawAssistantActivity = true;
+          clearStalledTimer(state);
+        }
       }
 
       const eventType = event.type as string;
+      if (eventType === "session.status") {
+        const props = event.properties as { sessionID?: string; status?: { type?: string } };
+        if (!props.sessionID || !props.status?.type) return;
+        const state = getState(props.sessionID);
+        state.busy = props.status.type === "busy";
+        if (state.busy) {
+          startStalledTimer(props.sessionID, state);
+        } else if (props.status.type === "idle") {
+          handleSessionIdle(props.sessionID);
+        } else {
+          clearStalledTimer(state);
+        }
+      }
+
       if (
         eventType === "permission.updated" ||
         eventType === "permission.asked" ||
@@ -1339,6 +1449,7 @@ const plugin: Plugin = async ({ client, directory }) => {
         if (state.turn.waitingForPermission) {
           state.pendingContinue = false;
           clearIdleTimer(state);
+          clearStalledTimer(state);
         }
       }
 
@@ -1357,6 +1468,7 @@ const plugin: Plugin = async ({ client, directory }) => {
         if (state.turn.waitingForQuestion) {
           state.pendingContinue = false;
           clearIdleTimer(state);
+          clearStalledTimer(state);
         }
       }
 
@@ -1366,21 +1478,7 @@ const plugin: Plugin = async ({ client, directory }) => {
         const sessionID = props.sessionID;
         if (!sessionID) return;
 
-        const config = getEffectiveConfig(sessionID);
-        if (!config.enabled) return;
-
-        const state = sessions.get(sessionID);
-        if (!state || state.idleTimer) return;
-        if (state.turn.aborted || state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
-        if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
-
-        log(`${sessionID} idle with pending continue, waiting ${config.delayMs}ms...`);
-        state.idleTimer = setTimeout(() => {
-          state.idleTimer = undefined;
-          if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
-          state.pendingContinue = true;
-          void sendContinue(sessionID);
-        }, config.delayMs);
+        handleSessionIdle(sessionID);
       }
     },
 
@@ -1390,6 +1488,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       state.turn.waitingForQuestion = true;
       state.pendingContinue = false;
       clearIdleTimer(state);
+      clearStalledTimer(state);
     },
 
     "tool.execute.after": async (input: { sessionID?: string; tool?: string }) => {
@@ -1398,7 +1497,10 @@ const plugin: Plugin = async ({ client, directory }) => {
     },
 
     dispose: async () => {
-      for (const state of sessions.values()) clearIdleTimer(state);
+      for (const state of sessions.values()) {
+        clearIdleTimer(state);
+        clearStalledTimer(state);
+      }
     },
   };
 };
