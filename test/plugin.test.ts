@@ -86,6 +86,23 @@ describe("empty response recovery", () => {
     expect(prompts).toHaveLength(1);
   });
 
+  test("keeps an empty-response retry when the user message summary is updated", async () => {
+    const { event, prompts, settle } = await createHarness({ delayMs: 5 });
+    await userTurn(event);
+    await emptyAssistant(event);
+    await event("message.updated", {
+      info: {
+        id: "user-1",
+        sessionID: "session-1",
+        role: "user",
+        summary: { diffs: [] },
+      },
+    });
+    await settle();
+
+    expect(prompts).toHaveLength(1);
+  });
+
   test("allows empty response recovery to be disabled", async () => {
     const { event, prompts, settle } = await createHarness({ retryEmptyResponses: false });
     await userTurn(event);

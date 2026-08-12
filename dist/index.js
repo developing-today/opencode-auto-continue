@@ -1217,6 +1217,9 @@ const plugin = async ({ client, directory }) => {
                     return;
                 const state = getState(info.sessionID);
                 if (info.role === "user") {
+                    if (info.id === state.userMessageID)
+                        return;
+                    state.userMessageID = info.id;
                     resetTurn(state);
                     return;
                 }

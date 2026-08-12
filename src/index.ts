@@ -268,6 +268,7 @@ interface Config {
 }
 
 interface SessionState {
+  userMessageID?: string;
   lastErrorTime: number;
   lastContinueTime: number;
   pendingContinue: boolean;
@@ -1364,6 +1365,8 @@ const plugin: Plugin = async ({ client, directory }) => {
 
         const state = getState(info.sessionID);
         if (info.role === "user") {
+          if (info.id === state.userMessageID) return;
+          state.userMessageID = info.id;
           resetTurn(state);
           return;
         }
