@@ -103,6 +103,23 @@ describe("empty response recovery", () => {
     expect(prompts).toHaveLength(1);
   });
 
+  test("continues an unknown zero-output response that contains partial text", async () => {
+    const { event, prompts, settle } = await createHarness({ delayMs: 5 });
+    await userTurn(event);
+    await emptyAssistant(event);
+    await event("message.part.updated", {
+      part: {
+        sessionID: "session-1",
+        messageID: "assistant-empty",
+        type: "text",
+        text: "partial result",
+      },
+    });
+    await settle();
+
+    expect(prompts).toHaveLength(1);
+  });
+
   test("allows empty response recovery to be disabled", async () => {
     const { event, prompts, settle } = await createHarness({ retryEmptyResponses: false });
     await userTurn(event);

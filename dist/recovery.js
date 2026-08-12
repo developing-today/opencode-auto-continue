@@ -35,7 +35,6 @@ export function isCompletedEmptyResponse(turn) {
     return Boolean(assistant &&
         assistant.finish === "unknown" &&
         assistant.outputTokens === 0 &&
-        !assistant.sawText &&
         !assistant.error &&
         !turn.aborted &&
         !turn.waitingForQuestion &&

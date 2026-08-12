@@ -7,7 +7,7 @@ import {
 } from "../src/recovery.js";
 
 describe("completed empty response detection", () => {
-  test("accepts only unknown, zero-output, textless assistant completion", () => {
+  test("accepts an unknown zero-output assistant completion", () => {
     const turn = createTurnEvidence();
     updateAssistantEvidence(turn, {
       id: "assistant-1",
@@ -22,7 +22,6 @@ describe("completed empty response detection", () => {
     ["normal stop", { finish: "stop", output: 10, text: "done" }],
     ["tool call", { finish: "tool-calls", output: 10, text: "" }],
     ["unknown with output", { finish: "unknown", output: 1, text: "" }],
-    ["unknown with text", { finish: "unknown", output: 0, text: "partial" }],
   ])("rejects %s", (_name, value) => {
     const turn = createTurnEvidence();
     updateAssistantEvidence(turn, {
@@ -37,6 +36,22 @@ describe("completed empty response detection", () => {
     });
 
     expect(isCompletedEmptyResponse(turn)).toBe(false);
+  });
+
+  test("accepts partial text from an unknown zero-output completion", () => {
+    const turn = createTurnEvidence();
+    updateAssistantEvidence(turn, {
+      id: "assistant-1",
+      finish: "unknown",
+      tokens: { output: 0 },
+    });
+    recordTextPart(turn, {
+      messageID: "assistant-1",
+      type: "text",
+      text: "partial",
+    });
+
+    expect(isCompletedEmptyResponse(turn)).toBe(true);
   });
 
   test("tracks text only for the latest assistant message", () => {
