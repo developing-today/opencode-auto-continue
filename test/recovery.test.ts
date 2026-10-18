@@ -18,6 +18,17 @@ describe("completed empty response detection", () => {
     expect(isCompletedEmptyResponse(turn)).toBe(true);
   });
 
+  test("accepts the OpenCode v2 token usage shape", () => {
+    const turn = createTurnEvidence();
+    updateAssistantEvidence(turn, {
+      id: "assistant-1",
+      finish: "unknown",
+      tokens: { input: 120, output: 0, reasoning: 0, cache: { read: 100, write: 20 } },
+    });
+
+    expect(isCompletedEmptyResponse(turn)).toBe(true);
+  });
+
   test.each([
     ["normal stop", { finish: "stop", output: 10, text: "done" }],
     ["tool call", { finish: "tool-calls", output: 10, text: "" }],

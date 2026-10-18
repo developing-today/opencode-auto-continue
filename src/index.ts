@@ -1,6 +1,7 @@
-import { access, lstat, mkdir, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Plugin } from "@opencode-ai/plugin";
+import { Plugin } from "@opencode/plugin";
+import type { OpenCodeEvent } from "@opencode/client";
 import {
   createTurnEvidence,
   isCompletedEmptyResponse,
@@ -12,199 +13,30 @@ import {
 const PLUGIN_NAME = "opencode-auto-continue";
 const CONFIG_DIR = ".opencode";
 const CONFIG_FILE = `${PLUGIN_NAME}.jsonc`;
-const GITHUB_REPO = "developing-today/opencode-auto-continue";
-const GITHUB_API_COMMITS = `https://api.github.com/repos/${GITHUB_REPO}/commits/main`;
-const GITHUB_API_RELEASE = `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/latest`;
-const LOADED_COMMIT_FILE = "auto-continue-loaded-commit";
-
-// ─── Platform-aware directory resolution ────────────────────────────────────
-// opencode uses xdg-basedir (sindresorhus) for all paths. On both macOS and
-// Linux, this resolves to the standard XDG locations unless overridden by env.
-
-interface OpencodeDirs {
-  home: string;
-  config: string; // opencode.jsonc, plugin config, SDK deps (package.json, lock files, node_modules)
-  cache: string; // packages/, models.json, bin/, version (CACHE_VERSION guard)
-  data: string; // SQLite DB, auth, logs, snapshots, tool-output, bin/ (LSP servers)
-  state: string; // locks, model.json, prompt-history
-}
-
-function getOpencodeDirs(): OpencodeDirs {
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const xdgConfig = process.env.XDG_CONFIG_HOME || join(home, ".config");
-  const xdgCache = process.env.XDG_CACHE_HOME || join(home, ".cache");
-  const xdgData = process.env.XDG_DATA_HOME || join(home, ".local", "share");
-  const xdgState = process.env.XDG_STATE_HOME || join(home, ".local", "state");
-  return {
-    home,
-    config: join(xdgConfig, "opencode"),
-    cache: join(xdgCache, "opencode"),
-    data: join(xdgData, "opencode"),
-    state: join(xdgState, "opencode"),
-  };
-}
-
-/** All platform-specific bun cache directories */
-function getBunCacheDirs(): string[] {
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const xdgCache = process.env.XDG_CACHE_HOME || join(home, ".cache");
-  const dirs: string[] = [];
-  // macOS: ~/Library/Caches/bun
-  if (process.platform === "darwin") {
-    dirs.push(join(home, "Library", "Caches", "bun"));
-  }
-  // Linux / XDG: ~/.cache/.bun
-  dirs.push(join(xdgCache, ".bun"));
-  // Older bun versions: ~/.bun/install/cache
-  dirs.push(join(home, ".bun", "install", "cache"));
-  return dirs;
-}
-
-/** npm/arborist cache directory */
-function getNpmCacheDir(): string {
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  return process.env.npm_config_cache || join(home, ".npm");
-}
-
-// ─── Content hash from lock files ───────────────────────────────────────────
-
-/** Extract sha512 integrity hash for this plugin from a bun.lock file */
-function readHashFromBunLock(raw: string): string | null {
-  const pattern = new RegExp(`"${PLUGIN_NAME}":\\s*\\[.*?,\\s*"(sha512-[^"]+)"`);
-  const match = raw.match(pattern);
-  return match?.[1] ?? null;
-}
-
-/** Extract integrity hash for this plugin from a package-lock.json (arborist/npm) */
-function readHashFromNpmLock(raw: string): string | null {
-  try {
-    const lock = JSON.parse(raw);
-    const packages: Record<string, { integrity?: string }> = lock.packages || {};
-    for (const [key, val] of Object.entries(packages)) {
-      if (key.includes(PLUGIN_NAME) && val?.integrity) {
-        return val.integrity;
-      }
-    }
-  } catch {}
-  return null;
-}
-
-function shortHash(hash: string): string {
-  const body = hash.startsWith("sha512-") ? hash.slice(7) : hash;
-  return body.slice(0, 12);
-}
-
-/**
- * Search all possible lock file locations for this plugin's installed hash.
- *
- * OpenCode uses @npmcli/arborist (npm) to install plugins into
- * <xdgCache>/opencode/packages/<sanitized-spec>/, creating package-lock.json.
- * It also installs SDK deps into <xdgConfig>/opencode/ which may create
- * bun.lock or package-lock.json. We search all known locations.
- */
-async function readInstalledHash(): Promise<string | null> {
-  const { config, cache } = getOpencodeDirs();
-
-  // 1. Search cache/packages/ for plugin-specific lock files (arborist installs here)
-  try {
-    const packagesDir = join(cache, "packages");
-    const entries = await readdir(packagesDir);
-    for (const entry of entries) {
-      if (!entry.startsWith(PLUGIN_NAME)) continue;
-      const hash = await searchDirForHash(join(packagesDir, entry));
-      if (hash) return hash;
-    }
-  } catch {}
-
-  // 2. Config dir lock files (SDK deps, may contain plugin if installed there)
-  for (const dir of [config, cache]) {
-    for (const { name, reader } of [
-      { name: "package-lock.json", reader: readHashFromNpmLock },
-      { name: "bun.lock", reader: readHashFromBunLock },
-    ]) {
-      try {
-        const raw = await readFile(join(dir, name), "utf-8");
-        const hash = reader(raw);
-        if (hash) return hash;
-      } catch {}
-    }
-  }
-
-  return null;
-}
-
-/** Recursively search a directory tree for lock files containing our plugin hash */
-async function searchDirForHash(dir: string, depth = 0): Promise<string | null> {
-  if (depth > 15) return null;
-  try {
-    const entries = await readdir(dir, { withFileTypes: true });
-    // Check lock files in this directory first
-    for (const entry of entries) {
-      if (!entry.isFile()) continue;
-      if (entry.name === "package-lock.json" || entry.name === ".package-lock.json") {
-        try {
-          const raw = await readFile(join(dir, entry.name), "utf-8");
-          const hash = readHashFromNpmLock(raw);
-          if (hash) return hash;
-        } catch {}
-      }
-      if (entry.name === "bun.lock") {
-        try {
-          const raw = await readFile(join(dir, entry.name), "utf-8");
-          const hash = readHashFromBunLock(raw);
-          if (hash) return hash;
-        } catch {}
-      }
-    }
-    // Recurse into subdirectories (arborist URL specs create nested dirs)
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const hash = await searchDirForHash(join(dir, entry.name), depth + 1);
-      if (hash) return hash;
-    }
-  } catch {}
-  return null;
-}
-
-// ─── Persistent loaded-commit cache ─────────────────────────────────────────
-// Stores the commit SHA associated with the loaded content hash so it survives
-// restarts. Lives in the XDG cache dir and gets wiped by /ac global update.
-
-async function readLoadedCommitFile(): Promise<{ hash: string; commitSha: string } | null> {
-  try {
-    const { cache } = getOpencodeDirs();
-    const content = await readFile(join(cache, LOADED_COMMIT_FILE), "utf-8");
-    const lines = content.trim().split("\n");
-    if (lines.length >= 2 && lines[0] && lines[1]) {
-      return { hash: lines[0], commitSha: lines[1] };
-    }
-  } catch {}
-  return null;
-}
-
-async function writeLoadedCommitFile(hash: string, commitSha: string): Promise<void> {
-  try {
-    const { cache } = getOpencodeDirs();
-    await mkdir(cache, { recursive: true });
-    await writeFile(join(cache, LOADED_COMMIT_FILE), `${hash}\n${commitSha}\n`, "utf-8");
-  } catch {}
-}
 
 // ─── Default retryable error patterns ───────────────────────────────────────
-// Matched case-insensitively against "${errorName}: ${errorMessage}".
+// Matched case-insensitively against "${errorType}: ${errorMessage}".
 // Override via config file's "errorPatterns" array.
 
 const DEFAULT_ERROR_PATTERNS: string[] = [
-  // API / provider errors (from DB: 63 occurrences)
+  // OpenCode v2 structured error types
+  "provider.invalid-request",
+  "provider.invalid-output",
+  "provider.transport",
+  "provider.timeout",
+  "provider.internal",
+  "provider.unknown",
+  "tool.execution",
+  // API / provider error messages
   "bad request",
   "reasoning_opaque",
   "prefill",
   "SSE read timed out",
   "DecimalError",
-  // Context / compaction errors (from DB: 7 occurrences)
+  // Context / compaction errors
   "ContextOverflowError",
   "too large to compact",
-  // Tool execution errors (from GitHub issues)
+  // Tool execution errors
   "Invalid diff",
   "Tool execution aborted",
   "JSON parsing failed",
@@ -234,7 +66,7 @@ const DEFAULT_EXCLUDE_PATTERNS: string[] = [
 const DEFAULTS: Config = {
   /** Minimum ms between auto-continues for the same session */
   throttleMs: 5_000,
-  /** Delay after session.idle before sending continue */
+  /** Delay after the session goes idle before sending continue */
   delayMs: 500,
   /** Max consecutive auto-continues per session before giving up (0 = unlimited) */
   maxConsecutive: 5,
@@ -244,10 +76,6 @@ const DEFAULTS: Config = {
   retryEmptyResponses: true,
   /** Abort and retry a busy request with no assistant activity after this delay (0 disables) */
   stalledRequestTimeoutMs: 200_000,
-  /** Minimum ms between remote version checks */
-  updateThrottleMs: 30_000,
-  /** Disable all remote calls and version-related filesystem checks */
-  offlineMode: false,
   /** Error patterns to auto-continue on (case-insensitive substrings) */
   errorPatterns: DEFAULT_ERROR_PATTERNS,
   /** Error patterns to NEVER auto-continue on (checked first, case-insensitive substrings) */
@@ -261,8 +89,6 @@ interface Config {
   enabled: boolean;
   retryEmptyResponses: boolean;
   stalledRequestTimeoutMs: number;
-  updateThrottleMs: number;
-  offlineMode: boolean;
   errorPatterns: string[];
   excludePatterns: string[];
 }
@@ -338,8 +164,6 @@ async function loadConfig(directory: string, log: (msg: string) => void): Promis
     if (typeof parsed.stalledRequestTimeoutMs === "number") {
       config.stalledRequestTimeoutMs = parsed.stalledRequestTimeoutMs;
     }
-    if (typeof parsed.updateThrottleMs === "number") config.updateThrottleMs = parsed.updateThrottleMs;
-    if (typeof parsed.offlineMode === "boolean") config.offlineMode = parsed.offlineMode;
     if (Array.isArray(parsed.errorPatterns)) {
       config.errorPatterns = parsed.errorPatterns.filter((p): p is string => typeof p === "string");
     }
@@ -360,18 +184,28 @@ async function loadConfig(directory: string, log: (msg: string) => void): Promis
   }
 }
 
-function isRetryableError(error: unknown, config: Config): boolean {
-  if (!error || typeof error !== "object") return false;
-
+/**
+ * Extract the error type/name and message from an OpenCode v2 structured error
+ * (`{ type, message, status?, response? }`) while tolerating legacy
+ * `{ name, message, data: { message } }` shapes.
+ */
+function errorParts(error: unknown): { type: string; message: string } {
+  if (!error || typeof error !== "object") return { type: "", message: "" };
   const err = error as Record<string, unknown>;
   const data = err.data as Record<string, unknown> | undefined;
-  const name = typeof err.name === "string" ? err.name : "";
+  const type = typeof err.type === "string" ? err.type : typeof err.name === "string" ? err.name : "";
   const message =
     (typeof data?.message === "string" ? data.message : null) ??
     (typeof err.message === "string" ? err.message : "");
+  return { type, message };
+}
 
-  // Build a single matchable string: "ErrorName: error message text"
-  const matchStr = `${name}: ${message}`.toLowerCase();
+function isRetryableError(error: unknown, config: Config): boolean {
+  if (!error || typeof error !== "object") return false;
+
+  const { type, message } = errorParts(error);
+  // Build a single matchable string: "ErrorType: error message text"
+  const matchStr = `${type}: ${message}`.toLowerCase();
 
   // Exclude patterns checked first — if any match, never retry
   for (const pattern of config.excludePatterns) {
@@ -389,13 +223,8 @@ function isRetryableError(error: unknown, config: Config): boolean {
 function isExcludedError(error: unknown, config: Config): boolean {
   if (!error || typeof error !== "object") return false;
 
-  const err = error as Record<string, unknown>;
-  const data = err.data as Record<string, unknown> | undefined;
-  const name = typeof err.name === "string" ? err.name : "";
-  const message =
-    (typeof data?.message === "string" ? data.message : null) ??
-    (typeof err.message === "string" ? err.message : "");
-  const matchStr = `${name}: ${message}`.toLowerCase();
+  const { type, message } = errorParts(error);
+  const matchStr = `${type}: ${message}`.toLowerCase();
   return config.excludePatterns.some((pattern) => matchStr.includes(pattern.toLowerCase()));
 }
 
@@ -406,1117 +235,921 @@ function errorMessage(error: unknown): string {
   return (
     (typeof data?.message === "string" ? data.message : null) ??
     (typeof err.message === "string" ? err.message : null) ??
-    String(err.name ?? "unknown")
+    String(err.type ?? err.name ?? "unknown")
   );
 }
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 // ─── Plugin ─────────────────────────────────────────────────────────────────
 
-const plugin: Plugin = async ({ client, directory }) => {
-  const sessions = new Map<string, SessionState>();
-  const sessionConfigs = new Map<string, Partial<Config>>();
+const plugin = Plugin.define({
+  id: PLUGIN_NAME,
 
-  // Silent log — console.log leaks into the TUI as raw terminal output
-  function log(_msg: string) {
-    // intentionally silent
-  }
+  async setup(ctx) {
+    const directory = ctx.location.directory;
+    const sessions = new Map<string, SessionState>();
+    const sessionConfigs = new Map<string, Partial<Config>>();
+    // Inbox IDs of the display-only synthetic messages this plugin sends, so
+    // their delivery does not reset the turn state they report on.
+    const ownInboxIDs = new Set<string>();
 
-  // Global config — loaded from file, mutated by /auto-continue global commands
-  const globalConfig = await loadConfig(directory, log);
+    // Silent log — console.log leaks into the TUI as raw terminal output
+    function log(_msg: string) {
+      // intentionally silent
+    }
 
-  // Snapshot content hash at load time
-  const loadedHash = await readInstalledHash();
-  log(`Loaded with content hash: ${loadedHash ?? "unknown"}`);
+    // Global config — loaded from file, mutated by /auto-continue global commands
+    const globalConfig = await loadConfig(directory, log);
 
-  // Cached remote version check (debounced)
-  let lastRemoteCheck = 0;
-  let cachedRemoteHash: string | null = null;
-  let cachedCommitSha: string | null = null;
-  // Commit SHA for the loaded version — persisted to XDG cache file
-  let loadedCommitSha: string | null = null;
-  let loadedCommitConfirmed = false; // true = verified via direct hash match with remote
-  let loadedCommitUncertain = false; // true = from file with mismatched hash → show "?"
+    // Merge global config with per-session overrides
+    function getEffectiveConfig(sessionID?: string): Config {
+      if (!sessionID) return globalConfig;
+      const overrides = sessionConfigs.get(sessionID);
+      if (!overrides) return globalConfig;
+      return { ...globalConfig, ...overrides };
+    }
 
-  // On-load: try to recover loadedCommitSha from cache file, fall back to remote
-  if (!globalConfig.offlineMode && loadedHash) {
-    try {
-      const cached = await readLoadedCommitFile();
-      if (cached && cached.hash === loadedHash) {
-        loadedCommitSha = cached.commitSha;
-        // Hash-verified from file — reliable but not yet confirmed with remote
-      } else if (cached) {
-        loadedCommitSha = cached.commitSha;
-        loadedCommitUncertain = true; // file hash ≠ loadedHash
+    // Write a message that appears in chat but does NOT trigger the LLM.
+    // The inbox ID is generated up-front and registered before the call, so a
+    // session.inbox.delivered event that beats the response cannot reset the
+    // turn state the message reports on.
+    async function sendMessage(sessionID: string, text: string) {
+      const messageID = `msg_${crypto.randomUUID()}`;
+      // Bound the tracking set: IDs are removed when their delivery is
+      // observed, but missed deliveries must not accumulate forever.
+      if (ownInboxIDs.size > 512) {
+        const oldest = ownInboxIDs.values().next().value;
+        if (oldest !== undefined) ownInboxIDs.delete(oldest);
       }
-    } catch {}
-    // If still no commit SHA, do a one-time remote fetch to try to capture it
-    if (!loadedCommitSha) {
-      try { await fetchLatestHash(); } catch {}
-    }
-  }
-
-  /** Check whether the cached module has been cleared (by global update in any session) */
-  async function isCacheCleared(): Promise<boolean> {
-    const { cache } = getOpencodeDirs();
-    // Check if cache dir exists at all
-    try {
-      await access(cache);
-    } catch {
-      return true; // entire cache gone → cleared
-    }
-    // Check packages dir for our plugin (may be in a nested URL-based path)
-    try {
-      const packagesDir = join(cache, "packages");
-      const entries = await readdir(packagesDir);
-      for (const entry of entries) {
-        if (!entry.startsWith(PLUGIN_NAME)) continue;
-        // Check if this dir has actual content (node_modules with files)
-        try {
-          const nmDir = join(packagesDir, entry, "node_modules");
-          await access(nmDir);
-          return false; // has node_modules → not cleared
-        } catch {}
-      }
-    } catch {}
-    return true; // plugin not found or empty → cleared
-  }
-
-  async function fetchLatestHash(): Promise<{ hash: string | null; commitSha: string | null }> {
-    if (globalConfig.offlineMode) {
-      return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
-    }
-    const cfg = globalConfig;
-    const now = Date.now();
-    if (now - lastRemoteCheck < cfg.updateThrottleMs) {
-      return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
-    }
-    try {
-      const response = await fetch(GITHUB_API_RELEASE, {
-        headers: { "User-Agent": PLUGIN_NAME },
-      });
-      if (!response.ok) return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
-      const release = (await response.json()) as { body?: string };
-      const body = release.body || "";
-      const bodyLines = body.split("\n");
-      cachedRemoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
-      const commitLine = bodyLines.find((l: string) => l.startsWith("Commit: "));
-      cachedCommitSha = commitLine?.replace("Commit: ", "").trim() ?? null;
-      lastRemoteCheck = now;
-
-      // Loaded commit SHA tracking — persist to cache file
-      if (loadedHash && cachedRemoteHash === loadedHash && cachedCommitSha) {
-        // Direct match — confirmed
-        loadedCommitSha = cachedCommitSha;
-        loadedCommitConfirmed = true;
-        loadedCommitUncertain = false;
-        writeLoadedCommitFile(loadedHash, cachedCommitSha).catch(() => {});
-      } else if (loadedHash && cachedRemoteHash !== loadedHash && !loadedCommitConfirmed) {
-        // Hashes don't match and not previously confirmed — re-read file each time
-        // (may have been cleared by global update in another session)
-        try {
-          const cached = await readLoadedCommitFile();
-          if (cached && cached.hash === loadedHash) {
-            loadedCommitSha = cached.commitSha;
-            loadedCommitUncertain = false;
-          } else if (cached) {
-            loadedCommitSha = cached.commitSha;
-            loadedCommitUncertain = true; // file hash ≠ loadedHash
-          } else {
-            loadedCommitSha = null;
-            loadedCommitUncertain = false;
-          }
-        } catch {
-          // Don't clear existing value on read failure
-        }
-      }
-    } catch {
-      // Network failure — keep stale cache
-    }
-    return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
-  }
-  // Version info for display
-  function formatLoadedCommitSuffix(remoteCommitSha?: string | null): string {
-    if (!loadedCommitSha) return " (commit: unknown)";
-    const short = loadedCommitSha.substring(0, 7);
-    // Same commit SHA but different content hashes → commit unreliable
-    if (remoteCommitSha && loadedCommitSha === remoteCommitSha
-        && loadedHash && cachedRemoteHash && loadedHash !== cachedRemoteHash) {
-      return " (commit: unknown)";
-    }
-    if (loadedCommitConfirmed) return ` (commit: ${short})`;
-    if (loadedCommitUncertain) return ` (commit: ${short}?)`;
-    return ` (commit: ${short})`;
-  }
-
-  async function versionInfo(checkRemote = false): Promise<string> {
-    const loadedShort = loadedHash ? shortHash(loadedHash) : "unknown";
-    const currentHash = await readInstalledHash();
-    const currentShort = currentHash ? shortHash(currentHash) : "unknown";
-
-    const lines: string[] = [];
-
-    // Local: loaded vs current bun.lock
-    const localUpdated = loadedHash && currentHash && loadedHash !== currentHash;
-
-    // Remote check (only when requested — status, help with /ac)
-    if (checkRemote) {
-      const { hash: remoteHash, commitSha } = await fetchLatestHash();
-      const remoteShort = remoteHash ? shortHash(remoteHash) : null;
-      const shortSha = commitSha?.substring(0, 7) ?? "";
-      const remoteCommitSuffix = shortSha ? ` (commit: ${shortSha})` : "";
-      const loadedCSuffix = formatLoadedCommitSuffix(commitSha);
-
-      if (remoteHash && remoteShort) {
-        const matchesLoaded = loadedHash === remoteHash;
-        const matchesCurrent = currentHash === remoteHash;
-        const cacheCleared = await isCacheCleared();
-
-        // Base version — include commit when up-to-date
-        if (matchesLoaded && matchesCurrent) {
-          lines.push(`${loadedShort}${remoteCommitSuffix}`);
-        } else {
-          lines.push(`${loadedShort}${loadedCSuffix}`);
-        }
-
-        if (localUpdated) {
-          lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
-        }
-
-        if (matchesLoaded && matchesCurrent) {
-          // All same — already shown commit above
-        } else if (!localUpdated && !matchesLoaded) {
-          // loaded == current, remote is different → update available
-          if (cacheCleared) {
-            lines.push(`  🆕 Update ready: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
-            lines.push(`     Restart opencode to load the new version`);
-          } else {
-            lines.push(`  🆕 Update available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
-            lines.push(`     Run /ac global update then restart opencode`);
-          }
-        } else if (localUpdated && matchesCurrent) {
-          // Already updated locally, matches remote — just needs reload (already shown above)
-        } else if (localUpdated && !matchesCurrent && !matchesLoaded) {
-          // All three differ: loaded ≠ current ≠ remote
-          if (cacheCleared) {
-            lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
-            lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
-            lines.push(`     Restart opencode to load the new version`);
-          } else {
-            lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
-            lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
-            lines.push(`     Run /ac global update then restart opencode`);
-          }
-        }
-      } else {
-        // Remote fetch failed or no remote hash — show base version with loaded commit if available
-        const fallbackSuffix = formatLoadedCommitSuffix(null);
-        lines.push(`${loadedShort}${fallbackSuffix !== " (commit: unknown)" ? fallbackSuffix : ""}`);
-        if (localUpdated) {
-          lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
-        }
-      }
-    } else {
-      // No remote check — just show base version
-      lines.push(loadedShort);
-      if (localUpdated) {
-        lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
-      }
-    }
-
-    return lines.join("\n");
-  }
-
-  // Merge global config with per-session overrides
-  function getEffectiveConfig(sessionID?: string): Config {
-    if (!sessionID) return globalConfig;
-    const overrides = sessionConfigs.get(sessionID);
-    if (!overrides) return globalConfig;
-    return { ...globalConfig, ...overrides };
-  }
-
-  // Send a message that appears in chat but does NOT trigger the LLM
-  async function sendMessage(sessionID: string, text: string) {
-    await client.session.prompt({
-      path: { id: sessionID },
-      body: {
-        noReply: true,
-        parts: [{ type: "text" as const, text, ignored: true }],
-      },
-    });
-  }
-
-  // Write current globalConfig to disk
-  async function writeGlobalConfig() {
-    const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
-    // Omit pattern arrays from disk if they're still the defaults
-    const toWrite: Record<string, unknown> = {
-      throttleMs: globalConfig.throttleMs,
-      delayMs: globalConfig.delayMs,
-      maxConsecutive: globalConfig.maxConsecutive,
-      enabled: globalConfig.enabled,
-      retryEmptyResponses: globalConfig.retryEmptyResponses,
-      stalledRequestTimeoutMs: globalConfig.stalledRequestTimeoutMs,
-      updateThrottleMs: globalConfig.updateThrottleMs,
-    };
-    if (globalConfig.offlineMode) {
-      toWrite.offlineMode = true;
-    }
-    if (globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS) {
-      toWrite.errorPatterns = globalConfig.errorPatterns;
-    }
-    if (globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS) {
-      toWrite.excludePatterns = globalConfig.excludePatterns;
-    }
-    const content = JSON.stringify(toWrite, null, 2) + "\n";
-    await writeFile(configPath, content, "utf-8");
-    log(`Wrote global config to ${configPath}`);
-  }
-
-  function getState(sessionID: string): SessionState {
-    let state = sessions.get(sessionID);
-    if (!state) {
-      state = {
-        lastErrorTime: 0,
-        lastContinueTime: 0,
-        pendingContinue: false,
-        consecutiveCount: 0,
-        turn: createTurnEvidence(),
-        busy: false,
-        pluginAbortPending: false,
-        sawAssistantActivity: false,
-      };
-      sessions.set(sessionID, state);
-    }
-    return state;
-  }
-
-  function clearIdleTimer(state: SessionState) {
-    if (state.idleTimer) clearTimeout(state.idleTimer);
-    state.idleTimer = undefined;
-  }
-
-  function clearStalledTimer(state: SessionState) {
-    if (state.stalledTimer) clearTimeout(state.stalledTimer);
-    state.stalledTimer = undefined;
-  }
-
-  function hasAssistantActivity(state: SessionState): boolean {
-    const assistant = state.turn.assistant;
-    return Boolean(
-      state.sawAssistantActivity ||
-        (assistant && (assistant.outputTokens > 0 || assistant.sawText || assistant.finish === "tool-calls")),
-    );
-  }
-
-  function startStalledTimer(sessionID: string, state: SessionState) {
-    const config = getEffectiveConfig(sessionID);
-    if (state.stalledTimer) return;
-    if (!config.enabled || config.stalledRequestTimeoutMs <= 0 || hasAssistantActivity(state)) return;
-    if (state.pluginAbortPending) return;
-    if (state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
-
-    state.stalledTimer = setTimeout(async () => {
-      state.stalledTimer = undefined;
-      const currentConfig = getEffectiveConfig(sessionID);
-      if (!currentConfig.enabled || !state.busy || hasAssistantActivity(state)) return;
-      if (state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
-      if (currentConfig.maxConsecutive > 0 && state.consecutiveCount >= currentConfig.maxConsecutive) return;
-
-      state.pluginAbortPending = true;
-      state.pendingContinue = true;
+      ownInboxIDs.add(messageID);
       try {
-        await client.session.abort({ path: { id: sessionID } });
+        const item = await ctx.session.synthetic({ sessionID, id: messageID, text, resume: false });
+        if (item?.id && item.id !== messageID) ownInboxIDs.add(item.id);
       } catch (err) {
-        state.pluginAbortPending = false;
-        state.pendingContinue = false;
-        log(`Failed to abort stalled request in ${sessionID}: ${err}`);
+        ownInboxIDs.delete(messageID);
+        log(`Failed to send message to ${sessionID}: ${err}`);
       }
-    }, config.stalledRequestTimeoutMs);
-  }
+    }
 
-  function resetTurn(state: SessionState) {
-    clearIdleTimer(state);
-    clearStalledTimer(state);
-    state.pendingContinue = false;
-    state.pluginAbortPending = false;
-    state.sawAssistantActivity = false;
-    state.turn = createTurnEvidence();
-  }
+    // Write current globalConfig to disk
+    async function writeGlobalConfig() {
+      const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
+      await mkdir(join(directory, CONFIG_DIR), { recursive: true });
+      // Omit pattern arrays from disk if they're still the defaults
+      const toWrite: Record<string, unknown> = {
+        throttleMs: globalConfig.throttleMs,
+        delayMs: globalConfig.delayMs,
+        maxConsecutive: globalConfig.maxConsecutive,
+        enabled: globalConfig.enabled,
+        retryEmptyResponses: globalConfig.retryEmptyResponses,
+        stalledRequestTimeoutMs: globalConfig.stalledRequestTimeoutMs,
+      };
+      if (globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS) {
+        toWrite.errorPatterns = globalConfig.errorPatterns;
+      }
+      if (globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS) {
+        toWrite.excludePatterns = globalConfig.excludePatterns;
+      }
+      const content = JSON.stringify(toWrite, null, 2) + "\n";
+      await writeFile(configPath, content, "utf-8");
+      log(`Wrote global config to ${configPath}`);
+    }
 
-  async function sendContinue(sessionID: string) {
-    const state = sessions.get(sessionID);
-    if (!state?.pendingContinue) return;
+    function getState(sessionID: string): SessionState {
+      let state = sessions.get(sessionID);
+      if (!state) {
+        state = {
+          lastErrorTime: 0,
+          lastContinueTime: 0,
+          pendingContinue: false,
+          consecutiveCount: 0,
+          turn: createTurnEvidence(),
+          busy: false,
+          pluginAbortPending: false,
+          sawAssistantActivity: false,
+        };
+        sessions.set(sessionID, state);
+      }
+      return state;
+    }
 
-    const config = getEffectiveConfig(sessionID);
-    const now = Date.now();
+    function clearIdleTimer(state: SessionState) {
+      if (state.idleTimer) clearTimeout(state.idleTimer);
+      state.idleTimer = undefined;
+    }
 
-    if (now - state.lastContinueTime < config.throttleMs) {
-      const remaining = config.throttleMs - (now - state.lastContinueTime);
-      log(`Throttle active for session ${sessionID}, retrying in ${remaining}ms`);
+    function clearStalledTimer(state: SessionState) {
+      if (state.stalledTimer) clearTimeout(state.stalledTimer);
+      state.stalledTimer = undefined;
+    }
+
+    function hasAssistantActivity(state: SessionState): boolean {
+      const assistant = state.turn.assistant;
+      return Boolean(
+        state.sawAssistantActivity ||
+          (assistant && (assistant.outputTokens > 0 || assistant.sawText || assistant.finish === "tool-calls")),
+      );
+    }
+
+    function markAssistantActivity(sessionID: string) {
+      const state = getState(sessionID);
+      state.sawAssistantActivity = true;
+      clearStalledTimer(state);
+    }
+
+    function startStalledTimer(sessionID: string, state: SessionState) {
+      const config = getEffectiveConfig(sessionID);
+      if (state.stalledTimer) return;
+      if (!config.enabled || config.stalledRequestTimeoutMs <= 0 || hasAssistantActivity(state)) return;
+      if (state.pluginAbortPending) return;
+      if (state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
+
+      state.stalledTimer = setTimeout(async () => {
+        state.stalledTimer = undefined;
+        const currentConfig = getEffectiveConfig(sessionID);
+        if (!currentConfig.enabled || !state.busy || hasAssistantActivity(state)) return;
+        if (state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
+        if (currentConfig.maxConsecutive > 0 && state.consecutiveCount >= currentConfig.maxConsecutive) return;
+
+        state.pluginAbortPending = true;
+        state.pendingContinue = true;
+        try {
+          await ctx.session.interrupt({ sessionID, resume: false });
+        } catch (err) {
+          state.pluginAbortPending = false;
+          state.pendingContinue = false;
+          log(`Failed to interrupt stalled request in ${sessionID}: ${err}`);
+        }
+      }, config.stalledRequestTimeoutMs);
+    }
+
+    function resetTurn(state: SessionState) {
       clearIdleTimer(state);
+      clearStalledTimer(state);
+      state.pendingContinue = false;
+      state.pluginAbortPending = false;
+      state.sawAssistantActivity = false;
+      state.turn = createTurnEvidence();
+    }
+
+    // Cancel any queued auto-continue (e.g. when the plugin is disabled for a
+    // session). Enabling again never resurrects the cancelled retry.
+    function cancelPendingRetry(sessionID: string) {
+      const state = sessions.get(sessionID);
+      if (!state) return;
+      state.pendingContinue = false;
+      clearIdleTimer(state);
+      clearStalledTimer(state);
+    }
+
+    function cancelAllPendingRetries() {
+      for (const sessionID of sessions.keys()) cancelPendingRetry(sessionID);
+    }
+
+    async function sendContinue(sessionID: string) {
+      const state = sessions.get(sessionID);
+      if (!state?.pendingContinue) return;
+
+      const config = getEffectiveConfig(sessionID);
+
+      // Re-validate at send time: the session may have been disabled or the
+      // turn state changed while a delay/throttle timer was pending.
+      if (
+        !config.enabled ||
+        state.busy ||
+        state.turn.aborted ||
+        state.turn.waitingForQuestion ||
+        state.turn.waitingForPermission
+      ) {
+        state.pendingContinue = false;
+        clearIdleTimer(state);
+        return;
+      }
+
+      const now = Date.now();
+
+      if (now - state.lastContinueTime < config.throttleMs) {
+        const remaining = config.throttleMs - (now - state.lastContinueTime);
+        log(`Throttle active for session ${sessionID}, retrying in ${remaining}ms`);
+        clearIdleTimer(state);
+        state.idleTimer = setTimeout(() => {
+          state.idleTimer = undefined;
+          void sendContinue(sessionID);
+        }, remaining);
+        return;
+      }
+
+      if (config.maxConsecutive > 0 && state.consecutiveCount >= config.maxConsecutive) {
+        log(`Max consecutive (${config.maxConsecutive}) reached for ${sessionID}, giving up`);
+        state.pendingContinue = false;
+        return;
+      }
+
+      state.lastContinueTime = now;
+      state.consecutiveCount++;
+      state.pendingContinue = false;
+
+      const maxLabel = config.maxConsecutive > 0 ? `${config.maxConsecutive}` : "∞";
+      log(`Sending "continue" to ${sessionID} (attempt ${state.consecutiveCount}/${maxLabel})`);
+
+      try {
+        // A plain prompt keeps the session's currently selected agent and model;
+        // the `agents` prompt field is only for explicit @-mentions.
+        await ctx.session.prompt({ sessionID, text: "continue" });
+        log(`Successfully sent "continue" to ${sessionID}`);
+      } catch (err) {
+        log(`Failed to send "continue" to ${sessionID}: ${err}`);
+      }
+    }
+
+    function handleSessionIdle(sessionID: string) {
+      const config = getEffectiveConfig(sessionID);
+      if (!config.enabled) return;
+
+      const state = sessions.get(sessionID);
+      if (!state || state.idleTimer) return;
+      state.busy = false;
+      clearStalledTimer(state);
+      if (state.pluginAbortPending) {
+        state.turn.aborted = false;
+      }
+      if (state.turn.aborted || state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
+      if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
+
+      log(`${sessionID} idle with pending continue, waiting ${config.delayMs}ms...`);
       state.idleTimer = setTimeout(() => {
         state.idleTimer = undefined;
+        if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
+        state.pendingContinue = true;
         void sendContinue(sessionID);
-      }, remaining);
-      return;
+      }, config.delayMs);
     }
 
-    if (config.maxConsecutive > 0 && state.consecutiveCount >= config.maxConsecutive) {
-      log(`Max consecutive (${config.maxConsecutive}) reached for ${sessionID}, giving up`);
-      state.pendingContinue = false;
-      return;
+    // ── Event handling ─────────────────────────────────────────────────────
+
+    // The event stream is not guaranteed to be scoped to this plugin's
+    // location: ctx.location describes where this instance loaded, not where
+    // every observed event happened. Events that carry a foreign location are
+    // skipped explicitly; events without a location cannot be attributed and
+    // are handled (the session state itself is keyed by sessionID).
+    interface LocationRefLike {
+      directory?: string;
+      workspaceID?: string;
     }
 
-    state.lastContinueTime = now;
-    state.consecutiveCount++;
-    state.pendingContinue = false;
-
-    const maxLabel = config.maxConsecutive > 0 ? `${config.maxConsecutive}` : "∞";
-    log(`Sending "continue" to ${sessionID} (attempt ${state.consecutiveCount}/${maxLabel})`);
-
-    try {
-      await client.session.promptAsync({
-        path: { id: sessionID },
-        body: {
-          parts: [{ type: "text" as const, text: "continue" }],
-        },
-      });
-      log(`Successfully sent "continue" to ${sessionID}`);
-    } catch (err) {
-      log(`Failed to send "continue" to ${sessionID}: ${err}`);
-    }
-  }
-
-  function handleSessionIdle(sessionID: string) {
-    const config = getEffectiveConfig(sessionID);
-    if (!config.enabled) return;
-
-    const state = sessions.get(sessionID);
-    if (!state || state.idleTimer) return;
-    state.busy = false;
-    clearStalledTimer(state);
-    if (state.pluginAbortPending) {
-      state.turn.aborted = false;
-    }
-    if (state.turn.aborted || state.turn.waitingForQuestion || state.turn.waitingForPermission) return;
-    if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
-
-    log(`${sessionID} idle with pending continue, waiting ${config.delayMs}ms...`);
-    state.idleTimer = setTimeout(() => {
-      state.idleTimer = undefined;
-      if (!state.pendingContinue && !(config.retryEmptyResponses && isCompletedEmptyResponse(state.turn))) return;
-      state.pendingContinue = true;
-      void sendContinue(sessionID);
-    }, config.delayMs);
-  }
-
-  // ── Command UI helpers ──────────────────────────────────────────────────
-
-  function overrideLines(overrides: Partial<Config>): string[] {
-    const parts: string[] = [];
-    if (overrides.enabled !== undefined) parts.push(`enabled: ${overrides.enabled}`);
-    if (overrides.throttleMs !== undefined) parts.push(`throttle: ${overrides.throttleMs}ms`);
-    if (overrides.delayMs !== undefined) parts.push(`delay: ${overrides.delayMs}ms`);
-    if (overrides.maxConsecutive !== undefined) parts.push(`max: ${overrides.maxConsecutive === 0 ? "unlimited" : overrides.maxConsecutive}`);
-    if (overrides.updateThrottleMs !== undefined) parts.push(`update-throttle: ${overrides.updateThrottleMs}ms`);
-    const globalParts = [
-      `enabled: ${globalConfig.enabled}`,
-      `throttle: ${globalConfig.throttleMs}ms`,
-      `delay: ${globalConfig.delayMs}ms`,
-      `max: ${globalConfig.maxConsecutive === 0 ? "unlimited" : globalConfig.maxConsecutive}`,
-    ];
-    if (globalConfig.updateThrottleMs !== DEFAULTS.updateThrottleMs) {
-      globalParts.push(`update-throttle: ${globalConfig.updateThrottleMs}ms`);
-    }
-    return ["", `  Session overrides: ${parts.join(" · ")}`, `  Global defaults:   ${globalParts.join(" · ")}`];
-  }
-
-  async function configSummaryLines(sessionID: string, checkRemote = false): Promise<string[]> {
-    const cfg = getEffectiveConfig(sessionID);
-    const overrides = sessionConfigs.get(sessionID);
-    const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
-    const ver = await versionInfo(checkRemote);
-    const maxDisplay = cfg.maxConsecutive === 0 ? "unlimited" : String(cfg.maxConsecutive);
-    const summaryParts = [`Throttle: ${cfg.throttleMs}ms`, `Delay: ${cfg.delayMs}ms`, `Max: ${maxDisplay}`];
-    if (cfg.updateThrottleMs !== DEFAULTS.updateThrottleMs) {
-      summaryParts.push(`Update: ${cfg.updateThrottleMs}ms`);
-    }
-    const lines = [`  Status: ${status} · ${ver}`, `  ${summaryParts.join(" · ")}`];
-    if (overrides && Object.keys(overrides).length > 0) {
-      lines.push(...overrideLines(overrides));
-    }
-    return lines;
-  }
-
-  async function helpText(sessionID: string): Promise<string> {
-    const lines = [
-      "╭──────────────────────────────────────────╮",
-      "│       Auto-Continue Commands             │",
-      "╰──────────────────────────────────────────╯",
-      "",
-      ...(await configSummaryLines(sessionID, true)),
-    ];
-
-    lines.push(
-      "",
-      "  /auto-continue on|off              Enable/disable (session)",
-      "  /auto-continue throttle <ms>         Set retry throttle (session)",
-      "  /auto-continue delay <ms>          Set delay (session)",
-      "  /auto-continue max <n>             Set max retries (session, 0=unlimited)",
-      "  /auto-continue update-throttle <ms>  Set update throttle (session)",
-      "  /auto-continue status              Show current settings",
-      "  /auto-continue patterns            Show active error patterns",
-      "  /auto-continue reload              Reload global config from disk",
-      "  /auto-continue reset               Clear session overrides",
-      "  /auto-continue global <cmd>        Persist setting to config file",
-      "  /auto-continue global update       Clear opencode cache to fetch latest version",
-      "  /auto-continue global update force Clear opencode + system bun/npm caches",
-      "  /auto-continue global offline on|off  Disable all remote/version checks",
-      "  /auto-continue help                Show this help",
-      "",
-      "  Alias: /ac (same commands, e.g. /ac status)",
-    );
-    return lines.join("\n");
-  }
-
-  async function statusText(sessionID: string): Promise<string> {
-    const cfg = getEffectiveConfig(sessionID);
-    const overrides = sessionConfigs.get(sessionID);
-    const state = sessions.get(sessionID);
-    const ver = await versionInfo(true);
-    const lines = [
-      "╭──────────────────────────────────────────╮",
-      "│       Auto-Continue Status               │",
-      "╰──────────────────────────────────────────╯",
-      "",
-      `  Version:         ${ver}`,
-      `  Enabled:         ${cfg.enabled ? "✅ yes" : "❌ no"}`,
-      `  Offline mode:    ${globalConfig.offlineMode ? "✅ on" : "❌ off"}`,
-      `  Throttle:        ${cfg.throttleMs}ms`,
-      `  Delay:           ${cfg.delayMs}ms`,
-      `  Max Retries:     ${cfg.maxConsecutive === 0 ? "unlimited (0)" : cfg.maxConsecutive}`,
-      `  Stall timeout:   ${cfg.stalledRequestTimeoutMs > 0 ? `${cfg.stalledRequestTimeoutMs}ms` : "disabled"}`,
-      `  Update throttle: ${cfg.updateThrottleMs}ms`,
-    ];
-
-    if (overrides && Object.keys(overrides).length > 0) {
-      lines.push("");
-      lines.push("  ── Session Overrides ──");
-      if (overrides.enabled !== undefined)
-        lines.push(
-          `  Enabled:         ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`,
-        );
-      if (overrides.throttleMs !== undefined)
-        lines.push(`  Throttle:        ${overrides.throttleMs}ms  (global: ${globalConfig.throttleMs}ms)`);
-      if (overrides.delayMs !== undefined)
-        lines.push(`  Delay:           ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
-      if (overrides.maxConsecutive !== undefined)
-        lines.push(`  Max Retries:     ${overrides.maxConsecutive === 0 ? "unlimited (0)" : overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive === 0 ? "unlimited (0)" : globalConfig.maxConsecutive})`);
-      if (overrides.updateThrottleMs !== undefined)
-        lines.push(`  Update throttle: ${overrides.updateThrottleMs}ms  (global: ${globalConfig.updateThrottleMs}ms)`);
-    }
-
-    const checkRemaining = lastRemoteCheck > 0
-      ? Math.max(0, cfg.updateThrottleMs - (Date.now() - lastRemoteCheck))
-      : null;
-
-    const retryRemaining = state?.lastContinueTime && state.lastContinueTime > 0
-      ? Math.max(0, cfg.throttleMs - (Date.now() - state.lastContinueTime))
-      : null;
-
-    lines.push(
-      "",
-      "  ── Session State ──",
-    );
-    if (retryRemaining !== null) {
-      lines.push(`  Retry cooldown:      ${retryRemaining > 0 ? `${retryRemaining}ms` : "ready"}`);
-    }
-    lines.push(
-      `  Consecutive retries: ${state?.consecutiveCount ?? 0}`,
-      `  Pending continue:    ${state?.pendingContinue ? "yes" : "no"}`,
-    );
-    if (checkRemaining !== null) {
-      lines.push(`  Update cooldown:     ${checkRemaining > 0 ? `${checkRemaining}ms` : "ready"}`);
-    }
-    lines.push(
-      "",
-      "  ── Global Config ──",
-      `  ${JSON.stringify({ ...globalConfig, errorPatterns: `[${globalConfig.errorPatterns.length} patterns]`, excludePatterns: `[${globalConfig.excludePatterns.length} patterns]` })}`,
-    );
-
-    const isCustomPatterns = globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS;
-    const isCustomExcludes = globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
-    lines.push(
-      "",
-      `  ── Error Patterns (${cfg.errorPatterns.length} match, ${cfg.excludePatterns.length} exclude) ──`,
-      `  Patterns: ${isCustomPatterns ? "custom" : "default"}  ·  Excludes: ${isCustomExcludes ? "custom" : "default"}`,
-      "  Run /ac patterns for full list",
-    );
-    return lines.join("\n");
-  }
-
-  // ── Hooks ───────────────────────────────────────────────────────────────
-
-  // Extracted command handler shared by /auto-continue and /ac
-  async function handleCommand(input: any) {
-    const args: string[] = (input.arguments || "").trim().split(/\s+/).filter(Boolean);
-    const subcmd = args[0]?.toLowerCase() || "";
-    const sessionID: string = input.sessionID;
-
-    // ── Help (default) ──
-    if (!subcmd || subcmd === "help") {
-      await sendMessage(sessionID, await helpText(sessionID));
-      throw new Error("__AUTO_CONTINUE_HANDLED__");
-    }
-
-    // ── On / Off ──
-    if (subcmd === "on" || subcmd === "off") {
-      const enabled = subcmd === "on";
-      const overrides = sessionConfigs.get(sessionID) || {};
-      overrides.enabled = enabled;
-      sessionConfigs.set(sessionID, overrides);
-      await sendMessage(sessionID, `Auto-continue ${enabled ? "✅ enabled" : "❌ disabled"} for this session.`);
-      throw new Error("__AUTO_CONTINUE_HANDLED__");
-    }
-
-    // ── Throttle / Delay / Max / Check-Interval ──
-    if (subcmd === "throttle" || subcmd === "delay" || subcmd === "max" || subcmd === "update-throttle") {
-      const value = parseInt(args[1], 10);
-      if (isNaN(value) || value < 0) {
-        await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue ${subcmd} <number>`);
-        throw new Error("__AUTO_CONTINUE_HANDLED__");
+    function isForeignLocation(event: OpenCodeEvent): boolean {
+      const location = (event as { location?: LocationRefLike }).location;
+      if (!location || typeof location.directory !== "string") return false;
+      if (location.directory !== ctx.location.directory) return true;
+      const ownWorkspace = ctx.location.workspaceID;
+      if (
+        ownWorkspace !== undefined &&
+        location.workspaceID !== undefined &&
+        location.workspaceID !== ownWorkspace
+      ) {
+        return true;
       }
-
-      const overrides = sessionConfigs.get(sessionID) || {};
-      const keyMap: Record<string, keyof Config> = {
-        throttle: "throttleMs",
-        delay: "delayMs",
-        max: "maxConsecutive",
-        "update-throttle": "updateThrottleMs",
-      };
-      (overrides as any)[keyMap[subcmd]] = value;
-      sessionConfigs.set(sessionID, overrides);
-
-      const label =
-        subcmd === "throttle"
-          ? "Throttle"
-          : subcmd === "delay"
-            ? "Delay"
-            : subcmd === "max"
-              ? "Max consecutive"
-              : "Update throttle";
-      const unit = subcmd === "max" ? "" : "ms";
-      await sendMessage(sessionID, `${label} set to ${value}${unit} for this session.`);
-      throw new Error("__AUTO_CONTINUE_HANDLED__");
+      return false;
     }
 
-    // ── Status ──
-    if (subcmd === "status") {
-      await sendMessage(sessionID, await statusText(sessionID));
-      throw new Error("__AUTO_CONTINUE_HANDLED__");
+    async function handleEvent(event: OpenCodeEvent): Promise<void> {
+      switch (event.type) {
+        // A new input was admitted into session history (user prompt, steering
+        // message, or synthetic input). Starts a fresh turn.
+        case "session.inbox.delivered": {
+          const { sessionID, inboxID } = event.data;
+          if (ownInboxIDs.delete(inboxID)) return; // our own display-only output
+          const state = getState(sessionID);
+          if (state.userMessageID === inboxID) return;
+          state.userMessageID = inboxID;
+          resetTurn(state);
+          return;
+        }
+
+        // Session status: busy while a turn is executing, retry while OpenCode
+        // schedules an internal retry, idle once the turn settles.
+        case "session.status": {
+          const { sessionID, status } = event.data;
+          const state = getState(sessionID);
+          if (status.type === "busy") {
+            state.busy = true;
+            startStalledTimer(sessionID, state);
+          } else if (status.type === "idle") {
+            handleSessionIdle(sessionID);
+          } else {
+            // "retry" — OpenCode is retrying the provider call itself.
+            state.busy = false;
+            clearStalledTimer(state);
+          }
+          return;
+        }
+
+        case "session.idle": {
+          handleSessionIdle(event.data.sessionID);
+          return;
+        }
+
+        case "session.execution.started": {
+          const { sessionID } = event.data;
+          const state = getState(sessionID);
+          state.busy = true;
+          startStalledTimer(sessionID, state);
+          return;
+        }
+
+        // The turn finished without a fatal error. No counter reset here: an
+        // empty response also "succeeds", and the counter must keep limiting.
+        case "session.execution.succeeded": {
+          handleSessionIdle(event.data.sessionID);
+          return;
+        }
+
+        // The turn failed with a terminal error.
+        case "session.execution.failed": {
+          const { sessionID, error } = event.data;
+          const config = getEffectiveConfig(sessionID);
+          if (!config.enabled) return;
+
+          const state = getState(sessionID);
+          state.busy = false;
+
+          if (state.pluginAbortPending) {
+            // Our own watchdog interrupt ended the turn — retry after idle.
+            handleSessionIdle(sessionID);
+            return;
+          }
+
+          if (isExcludedError(error, config)) {
+            state.turn.aborted = true;
+            state.pendingContinue = false;
+            clearIdleTimer(state);
+            clearStalledTimer(state);
+            return;
+          }
+
+          if (isRetryableError(error, config)) {
+            log(`Retryable error in ${sessionID}: ${errorMessage(error)}`);
+            state.lastErrorTime = Date.now();
+            state.pendingContinue = true;
+          }
+
+          // The turn is over; recover even if no idle/status event follows.
+          handleSessionIdle(sessionID);
+          return;
+        }
+
+        // The turn was interrupted. Either our stall watchdog did it (retry
+        // after idle) or the user/system did (never auto-continue).
+        case "session.execution.interrupted": {
+          const { sessionID } = event.data;
+          const state = getState(sessionID);
+          state.busy = false;
+
+          if (state.pluginAbortPending) {
+            state.turn.aborted = false;
+            handleSessionIdle(sessionID);
+            return;
+          }
+
+          state.turn.aborted = true;
+          state.pendingContinue = false;
+          clearIdleTimer(state);
+          clearStalledTimer(state);
+          return;
+        }
+
+        // A model step begins. Any earlier failure is being handled by
+        // OpenCode itself (internal retry or tool loop) — stand down.
+        case "session.step.started": {
+          const { sessionID, assistantMessageID } = event.data;
+          const state = getState(sessionID);
+          state.pendingContinue = false;
+          clearIdleTimer(state);
+          updateAssistantEvidence(state.turn, { id: assistantMessageID });
+          return;
+        }
+
+        case "session.step.streamed": {
+          markAssistantActivity(event.data.sessionID);
+          return;
+        }
+
+        case "session.step.ended": {
+          const { sessionID, assistantMessageID, finish, tokens } = event.data;
+          const state = getState(sessionID);
+          const config = getEffectiveConfig(sessionID);
+          updateAssistantEvidence(state.turn, { id: assistantMessageID, finish, tokens });
+          if (hasAssistantActivity(state)) {
+            state.sawAssistantActivity = true;
+            clearStalledTimer(state);
+          }
+
+          // Successful completion → clear pending retries and reset the counter
+          if (finish === "stop") {
+            clearIdleTimer(state);
+            clearStalledTimer(state);
+            state.pendingContinue = false;
+            if (state.consecutiveCount > 0) {
+              log(`${sessionID} completed successfully, resetting counter`);
+              state.consecutiveCount = 0;
+            }
+          }
+
+          // A completed-but-empty response may never see session.idle — reuse
+          // the same guarded recovery path so status and auto-continue agree.
+          if (
+            finish === "unknown" &&
+            config.retryEmptyResponses &&
+            isCompletedEmptyResponse(state.turn)
+          ) {
+            handleSessionIdle(sessionID);
+          }
+          return;
+        }
+
+        case "session.step.failed": {
+          const { sessionID, assistantMessageID, error, tokens } = event.data;
+          const config = getEffectiveConfig(sessionID);
+          if (!config.enabled) return;
+
+          const state = getState(sessionID);
+          updateAssistantEvidence(state.turn, { id: assistantMessageID, error, tokens });
+
+          if (state.pluginAbortPending) return;
+
+          if (isExcludedError(error, config)) {
+            state.turn.aborted = true;
+            state.pendingContinue = false;
+            clearIdleTimer(state);
+            clearStalledTimer(state);
+            return;
+          }
+
+          if (isRetryableError(error, config)) {
+            log(`Retryable error on assistant step in ${sessionID}: ${errorMessage(error)}`);
+            state.lastErrorTime = Date.now();
+            state.pendingContinue = true;
+          }
+          return;
+        }
+
+        // OpenCode scheduled its own retry — do not double-retry.
+        case "session.retry.scheduled": {
+          const state = getState(event.data.sessionID);
+          state.pendingContinue = false;
+          clearIdleTimer(state);
+          clearStalledTimer(state);
+          return;
+        }
+
+        case "session.text.delta":
+        case "session.reasoning.delta": {
+          if (!event.data.delta.trim()) return;
+          markAssistantActivity(event.data.sessionID);
+          return;
+        }
+
+        case "session.text.ended": {
+          const { sessionID, assistantMessageID, text } = event.data;
+          const state = getState(sessionID);
+          recordTextPart(state.turn, { messageID: assistantMessageID, type: "text", text });
+          if (text.trim()) markAssistantActivity(sessionID);
+          return;
+        }
+
+        case "session.reasoning.ended": {
+          if (!event.data.text.trim()) return;
+          markAssistantActivity(event.data.sessionID);
+          return;
+        }
+
+        case "session.tool.called":
+        case "session.tool.input.started":
+        case "session.tool.input.delta":
+        case "session.tool.progress":
+        case "session.tool.success":
+        case "session.tool.failed": {
+          markAssistantActivity(event.data.sessionID);
+          return;
+        }
+
+        // Permission prompts pause the turn and wait for the user.
+        case "permission.asked": {
+          const state = getState(event.data.sessionID);
+          state.turn.waitingForPermission = true;
+          state.pendingContinue = false;
+          clearIdleTimer(state);
+          clearStalledTimer(state);
+          return;
+        }
+        case "permission.replied": {
+          getState(event.data.sessionID).turn.waitingForPermission = false;
+          return;
+        }
+
+        // The question tool renders through forms; any pending form means the
+        // session is waiting for user input.
+        case "form.created": {
+          const sessionID = event.data.form.sessionID;
+          if (!sessionID) return;
+          const state = getState(sessionID);
+          state.turn.waitingForQuestion = true;
+          state.pendingContinue = false;
+          clearIdleTimer(state);
+          clearStalledTimer(state);
+          return;
+        }
+        case "form.replied":
+        case "form.cancelled": {
+          const sessionID = event.data.sessionID;
+          if (!sessionID) return;
+          getState(sessionID).turn.waitingForQuestion = false;
+          return;
+        }
+
+        case "session.deleted": {
+          const state = sessions.get(event.data.sessionID);
+          if (state) {
+            clearIdleTimer(state);
+            clearStalledTimer(state);
+          }
+          sessions.delete(event.data.sessionID);
+          sessionConfigs.delete(event.data.sessionID);
+          return;
+        }
+      }
     }
 
-    // ── Patterns (show all active error patterns) ──
-    if (subcmd === "patterns") {
+    // ── Command UI helpers ──────────────────────────────────────────────────
+
+    function overrideLines(overrides: Partial<Config>): string[] {
+      const parts: string[] = [];
+      if (overrides.enabled !== undefined) parts.push(`enabled: ${overrides.enabled}`);
+      if (overrides.throttleMs !== undefined) parts.push(`throttle: ${overrides.throttleMs}ms`);
+      if (overrides.delayMs !== undefined) parts.push(`delay: ${overrides.delayMs}ms`);
+      if (overrides.maxConsecutive !== undefined) parts.push(`max: ${overrides.maxConsecutive === 0 ? "unlimited" : overrides.maxConsecutive}`);
+      const globalParts = [
+        `enabled: ${globalConfig.enabled}`,
+        `throttle: ${globalConfig.throttleMs}ms`,
+        `delay: ${globalConfig.delayMs}ms`,
+        `max: ${globalConfig.maxConsecutive === 0 ? "unlimited" : globalConfig.maxConsecutive}`,
+      ];
+      return ["", `  Session overrides: ${parts.join(" · ")}`, `  Global defaults:   ${globalParts.join(" · ")}`];
+    }
+
+    async function configSummaryLines(sessionID: string): Promise<string[]> {
       const cfg = getEffectiveConfig(sessionID);
-      const isCustom = cfg.errorPatterns !== DEFAULT_ERROR_PATTERNS;
-      const isCustomExcl = cfg.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
+      const overrides = sessionConfigs.get(sessionID);
+      const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
+      const maxDisplay = cfg.maxConsecutive === 0 ? "unlimited" : String(cfg.maxConsecutive);
+      const summaryParts = [`Throttle: ${cfg.throttleMs}ms`, `Delay: ${cfg.delayMs}ms`, `Max: ${maxDisplay}`];
+      const lines = [`  Status: ${status}`, `  ${summaryParts.join(" · ")}`];
+      if (overrides && Object.keys(overrides).length > 0) {
+        lines.push(...overrideLines(overrides));
+      }
+      return lines;
+    }
+
+    async function helpText(sessionID: string): Promise<string> {
       const lines = [
         "╭──────────────────────────────────────────╮",
-        "│       Error Patterns                     │",
+        "│       Auto-Continue Commands             │",
         "╰──────────────────────────────────────────╯",
         "",
-        `  ── Match Patterns (${cfg.errorPatterns.length}) ${isCustom ? "[custom]" : "[default]"} ──`,
-        ...cfg.errorPatterns.map(p => `    • ${p}`),
-        "",
-        `  ── Exclude Patterns (${cfg.excludePatterns.length}) ${isCustomExcl ? "[custom]" : "[default]"} ──`,
-        ...cfg.excludePatterns.map(p => `    ✕ ${p}`),
-        "",
-        "  Matching: case-insensitive substring against \"ErrorName: message\"",
-        "  Excludes are checked first. Override via config file.",
+        ...(await configSummaryLines(sessionID)),
       ];
-      await sendMessage(sessionID, lines.join("\n"));
-      throw new Error("__AUTO_CONTINUE_HANDLED__");
+
+      lines.push(
+        "",
+        "  /auto-continue on|off              Enable/disable (session)",
+        "  /auto-continue throttle <ms>       Set retry throttle (session)",
+        "  /auto-continue delay <ms>          Set delay (session)",
+        "  /auto-continue max <n>             Set max retries (session, 0=unlimited)",
+        "  /auto-continue status              Show current settings",
+        "  /auto-continue patterns            Show active error patterns",
+        "  /auto-continue reload              Reload global config from disk",
+        "  /auto-continue reset               Clear session overrides",
+        "  /auto-continue global <cmd>        Persist setting to config file",
+        "  /auto-continue help                Show this help",
+        "",
+        "  Alias: /ac (same commands, e.g. /ac status)",
+      );
+      return lines.join("\n");
     }
 
-    // ── Reload (re-read global config from disk) ──
-    if (subcmd === "reload") {
-      const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
-      let fileExists = false;
-      let rawContents = "";
-      try {
-        rawContents = await readFile(configPath, "utf-8");
-        fileExists = true;
-      } catch {
-        // File doesn't exist
+    async function statusText(sessionID: string): Promise<string> {
+      const cfg = getEffectiveConfig(sessionID);
+      const overrides = sessionConfigs.get(sessionID);
+      const state = sessions.get(sessionID);
+      const lines = [
+        "╭──────────────────────────────────────────╮",
+        "│       Auto-Continue Status               │",
+        "╰──────────────────────────────────────────╯",
+        "",
+        `  Enabled:         ${cfg.enabled ? "✅ yes" : "❌ no"}`,
+        `  Throttle:        ${cfg.throttleMs}ms`,
+        `  Delay:           ${cfg.delayMs}ms`,
+        `  Max Retries:     ${cfg.maxConsecutive === 0 ? "unlimited (0)" : cfg.maxConsecutive}`,
+        `  Stall timeout:   ${cfg.stalledRequestTimeoutMs > 0 ? `${cfg.stalledRequestTimeoutMs}ms` : "disabled"}`,
+      ];
+
+      if (overrides && Object.keys(overrides).length > 0) {
+        lines.push("");
+        lines.push("  ── Session Overrides ──");
+        if (overrides.enabled !== undefined)
+          lines.push(
+            `  Enabled:         ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`,
+          );
+        if (overrides.throttleMs !== undefined)
+          lines.push(`  Throttle:        ${overrides.throttleMs}ms  (global: ${globalConfig.throttleMs}ms)`);
+        if (overrides.delayMs !== undefined)
+          lines.push(`  Delay:           ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
+        if (overrides.maxConsecutive !== undefined)
+          lines.push(`  Max Retries:     ${overrides.maxConsecutive === 0 ? "unlimited (0)" : overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive === 0 ? "unlimited (0)" : globalConfig.maxConsecutive})`);
       }
 
-      const reloaded = await loadConfig(directory, log);
-      Object.assign(globalConfig, reloaded);
+      const retryRemaining = state?.lastContinueTime && state.lastContinueTime > 0
+        ? Math.max(0, cfg.throttleMs - (Date.now() - state.lastContinueTime))
+        : null;
 
-      const lines: string[] = [];
-      if (fileExists) {
-        lines.push(
-          "Auto-continue global config reloaded",
-          `  From: ${configPath}`,
-          `  Contents: ${rawContents.trim()}`,
-        );
-      } else {
-        lines.push(
-          "Auto-continue global config reloaded",
-          `  No ${CONFIG_FILE} found at ${configPath} — using defaults`,
-        );
+      lines.push(
+        "",
+        "  ── Session State ──",
+      );
+      if (retryRemaining !== null) {
+        lines.push(`  Retry cooldown:      ${retryRemaining > 0 ? `${retryRemaining}ms` : "ready"}`);
       }
+      lines.push(
+        `  Consecutive retries: ${state?.consecutiveCount ?? 0}`,
+        `  Pending continue:    ${state?.pendingContinue ? "yes" : "no"}`,
+        "",
+        "  ── Global Config ──",
+        `  ${JSON.stringify({ ...globalConfig, errorPatterns: `[${globalConfig.errorPatterns.length} patterns]`, excludePatterns: `[${globalConfig.excludePatterns.length} patterns]` })}`,
+      );
 
-      lines.push("", ...(await configSummaryLines(sessionID)));
-
-      await sendMessage(sessionID, lines.join("\n"));
-
-      throw new Error("__AUTO_CONTINUE_HANDLED__");
+      const isCustomPatterns = globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS;
+      const isCustomExcludes = globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
+      lines.push(
+        "",
+        `  ── Error Patterns (${cfg.errorPatterns.length} match, ${cfg.excludePatterns.length} exclude) ──`,
+        `  Patterns: ${isCustomPatterns ? "custom" : "default"}  ·  Excludes: ${isCustomExcludes ? "custom" : "default"}`,
+        "  Run /ac patterns for full list",
+      );
+      return lines.join("\n");
     }
 
-    // ── Reset (clear session overrides) ──
-    if (subcmd === "reset") {
-      sessionConfigs.delete(sessionID);
-      await sendMessage(sessionID, "Session overrides cleared. Using global config.");
-      throw new Error("__AUTO_CONTINUE_HANDLED__");
-    }
+    // ── Command handler shared by /auto-continue and /ac ────────────────────
 
-    // ── Global ──
-    if (subcmd === "global") {
-      const globalSub = args[1]?.toLowerCase() || "";
+    async function handleCommand(sessionID: string, argsText: string) {
+      const args: string[] = argsText.trim().split(/\s+/).filter(Boolean);
+      const subcmd = args[0]?.toLowerCase() || "";
 
-      // ── Global Update: wipe all regenerable files, check for new version ──
-      if (globalSub === "update") {
-        const forceMode = args[2]?.toLowerCase() === "force";
-        try {
-          await sendMessage(sessionID, forceMode
-            ? "Checking for updates and cleaning all regenerable files + system caches..."
-            : "Checking for updates and cleaning opencode regenerable files...");
-
-          // 1. Fetch latest release metadata (skipped in offline mode)
-          let remoteHash: string | null = null;
-          let shortSha = "unknown";
-          let remoteShort = "unknown";
-          if (!globalConfig.offlineMode) {
-            try {
-              const response = await fetch(GITHUB_API_RELEASE, {
-                headers: { "User-Agent": PLUGIN_NAME },
-              });
-              if (response.ok) {
-                const release = (await response.json()) as { body?: string; tag_name?: string };
-                const body = release.body || "";
-                const bodyLines = body.split("\n");
-                remoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
-                const commitLine = bodyLines.find((l: string) => l.startsWith("Commit: "));
-                const commitSha = commitLine?.replace("Commit: ", "").trim();
-                shortSha = commitSha?.substring(0, 7) ?? "unknown";
-                remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
-                cachedRemoteHash = remoteHash;
-                cachedCommitSha = commitSha ?? null;
-                lastRemoteCheck = Date.now();
-                if (loadedHash && remoteHash === loadedHash && commitSha) {
-                  loadedCommitSha = commitSha;
-                  loadedCommitConfirmed = true;
-                  loadedCommitUncertain = false;
-                  // Don't write file here — cache dir is about to be wiped
-                }
-              }
-            } catch {
-              // Network failure — continue with cleanup anyway
-            }
-          }
-
-          const currentShort = loadedHash ? shortHash(loadedHash) : "unknown";
-          const isUpToDate = loadedHash && remoteHash && loadedHash === remoteHash;
-
-          // 2. Comprehensive cleanup of all regenerable files (always runs)
-          const dirs = getOpencodeDirs();
-          const cleaned: { label: string; realPath: string; isDir: boolean }[] = [];
-
-          async function tryRm(target: string, opts?: { recursive?: boolean; label?: string }) {
-            try {
-              await access(target);
-              const resolved = await realpath(target).catch(() => target);
-              const stats = await lstat(target).catch(() => null);
-              const isDir = stats?.isDirectory() ?? !!opts?.recursive;
-              await rm(target, { force: true, recursive: opts?.recursive });
-              cleaned.push({ label: opts?.label || target, realPath: resolved, isDir });
-            } catch {
-              // doesn't exist or can't remove — not critical
-            }
-          }
-
-          // a. Entire opencode cache dir (packages/, models.json, bin/, version)
-          //    This is the same wipe opencode's own CACHE_VERSION guard does on version bumps.
-          await tryRm(dirs.cache, { recursive: true, label: "cache dir (packages, models, version)" });
-
-          // b. Config dir: regenerable package artifacts (NOT config files like opencode.jsonc)
-          for (const name of ["bun.lock", "package.json", "package-lock.json"]) {
-            await tryRm(join(dirs.config, name), { label: `config/${name}` });
-          }
-          await tryRm(join(dirs.config, "node_modules"), { recursive: true, label: "config/node_modules" });
-
-          // c. Data dir: bin/ (LSP servers — re-downloaded on demand)
-          await tryRm(join(dirs.data, "bin"), { recursive: true, label: "data/bin (LSP servers)" });
-
-          // d. Stray package artifacts in data dir subdirectories
-          try {
-            const dataEntries = await readdir(dirs.data, { withFileTypes: true });
-            for (const entry of dataEntries) {
-              if (!entry.isDirectory() || entry.name === "bin") continue;
-              const sub = join(dirs.data, entry.name);
-              for (const name of ["bun.lock", "package.json", "package-lock.json"]) {
-                await tryRm(join(sub, name), { label: `data/${entry.name}/${name}` });
-              }
-              await tryRm(join(sub, "node_modules"), { recursive: true, label: `data/${entry.name}/node_modules` });
-            }
-          } catch {}
-
-          // e. Bun caches — system-wide, only with force (affects all bun projects)
-          if (forceMode) {
-            for (const dir of getBunCacheDirs()) {
-              await tryRm(dir, { recursive: true, label: "bun cache" });
-            }
-          }
-
-          // f. npm/arborist cache — system-wide, only with force (affects all npm projects)
-          if (forceMode) {
-            await tryRm(getNpmCacheDir(), { recursive: true, label: "npm cache" });
-          }
-
-          // 3. Report results
-          const loadedCSuffix = formatLoadedCommitSuffix(cachedCommitSha);
-          const remoteSuffix = shortSha !== "unknown" ? ` (commit: ${shortSha})` : "";
-          const versionLine = isUpToDate
-            ? `✅ Already up to date: ${currentShort}${remoteSuffix}`
-            : remoteHash
-              ? `🆕 Update available: ${currentShort}${loadedCSuffix} → ${remoteShort}${remoteSuffix}`
-              : `⚠️  Could not check remote version (loaded: ${currentShort})`;
-
-          const msg = [
-            versionLine,
-            "",
-            cleaned.length > 0
-              ? `Cleaned ${cleaned.length} items:`
-              : "Nothing to clean (already clean).",
-            ...cleaned.flatMap(c => [
-              `  • ${c.label}`,
-              `    ↳ ${c.realPath}${c.isDir ? "/" : ""}`,
-            ]),
-          ];
-          if (!forceMode) {
-            msg.push("", "  ℹ️  Run /ac global update force to also clear system-wide bun & npm caches");
-          }
-          msg.push("", "Restart opencode to reinstall plugins fresh.");
-          await sendMessage(sessionID, msg.join("\n"));
-        } catch (err: unknown) {
-          if (err instanceof Error && err.message === "__AUTO_CONTINUE_HANDLED__") throw err;
-          await sendMessage(sessionID, `❌ Update failed: ${err}`);
-        }
-        throw new Error("__AUTO_CONTINUE_HANDLED__");
+      // ── Help (default) ──
+      if (!subcmd || subcmd === "help") {
+        await sendMessage(sessionID, await helpText(sessionID));
+        return;
       }
 
-      if (globalSub === "on" || globalSub === "off") {
-        globalConfig.enabled = globalSub === "on";
-        await writeGlobalConfig();
-        await sendMessage(
-          sessionID,
-          `Global config: auto-continue ${globalSub === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`,
-        );
-        throw new Error("__AUTO_CONTINUE_HANDLED__");
+      // ── On / Off ──
+      if (subcmd === "on" || subcmd === "off") {
+        const enabled = subcmd === "on";
+        const overrides = sessionConfigs.get(sessionID) || {};
+        overrides.enabled = enabled;
+        sessionConfigs.set(sessionID, overrides);
+        if (!enabled) cancelPendingRetry(sessionID);
+        await sendMessage(sessionID, `Auto-continue ${enabled ? "✅ enabled" : "❌ disabled"} for this session.`);
+        return;
       }
 
-      if (globalSub === "offline") {
-        const val = args[2]?.toLowerCase();
-        if (val !== "on" && val !== "off") {
-          await sendMessage(sessionID, "❌ Usage: /auto-continue global offline on|off");
-          throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        globalConfig.offlineMode = val === "on";
-        await writeGlobalConfig();
-        await sendMessage(
-          sessionID,
-          `Global config: offline mode ${val === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`,
-        );
-        throw new Error("__AUTO_CONTINUE_HANDLED__");
-      }
-
-      if (globalSub === "throttle" || globalSub === "delay" || globalSub === "max" || globalSub === "update-throttle") {
-        const value = parseInt(args[2], 10);
+      // ── Throttle / Delay / Max ──
+      if (subcmd === "throttle" || subcmd === "delay" || subcmd === "max") {
+        const value = parseInt(args[1], 10);
         if (isNaN(value) || value < 0) {
-          await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue global ${globalSub} <number>`);
-          throw new Error("__AUTO_CONTINUE_HANDLED__");
+          await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue ${subcmd} <number>`);
+          return;
         }
 
+        const overrides: Partial<Record<keyof Config, unknown>> = sessionConfigs.get(sessionID) || {};
         const keyMap: Record<string, keyof Config> = {
           throttle: "throttleMs",
           delay: "delayMs",
           max: "maxConsecutive",
-          "update-throttle": "updateThrottleMs",
         };
-        (globalConfig as any)[keyMap[globalSub]] = value;
-        await writeGlobalConfig();
+        overrides[keyMap[subcmd]] = value;
+        sessionConfigs.set(sessionID, overrides as Partial<Config>);
 
         const label =
-          globalSub === "throttle"
+          subcmd === "throttle"
             ? "Throttle"
-            : globalSub === "delay"
+            : subcmd === "delay"
               ? "Delay"
-              : globalSub === "max"
-                ? "Max consecutive"
-                : "Update throttle";
-        const unit = globalSub === "max" ? "" : "ms";
-        await sendMessage(sessionID, `Global config: ${label} set to ${value}${unit}. Written to ${CONFIG_FILE}.`);
-        throw new Error("__AUTO_CONTINUE_HANDLED__");
+              : "Max consecutive";
+        const unit = subcmd === "max" ? "" : "ms";
+        await sendMessage(sessionID, `${label} set to ${value}${unit} for this session.`);
+        return;
       }
 
-      // Global help (no recognized subcommand)
-      const text = [
-        "Usage: /auto-continue global <subcommand>",
-        "",
-        "  on|off              Enable/disable globally",
-        "  throttle <ms>       Set global retry throttle",
-        "  delay <ms>          Set global delay",
-        "  max <n>             Set global max retries (0=unlimited)",
-        "  update-throttle <ms> Set global update throttle",
-        "  update              Clear opencode cache to fetch latest version",
-        "  update force        Also clear system-wide bun & npm caches",
-        "  offline on|off      Disable all remote/version checks",
-      ].join("\n");
-      await sendMessage(sessionID, text);
-      throw new Error("__AUTO_CONTINUE_HANDLED__");
+      // ── Status ──
+      if (subcmd === "status") {
+        await sendMessage(sessionID, await statusText(sessionID));
+        return;
+      }
+
+      // ── Patterns (show all active error patterns) ──
+      if (subcmd === "patterns") {
+        const cfg = getEffectiveConfig(sessionID);
+        const isCustom = cfg.errorPatterns !== DEFAULT_ERROR_PATTERNS;
+        const isCustomExcl = cfg.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
+        const lines = [
+          "╭──────────────────────────────────────────╮",
+          "│       Error Patterns                     │",
+          "╰──────────────────────────────────────────╯",
+          "",
+          `  ── Match Patterns (${cfg.errorPatterns.length}) ${isCustom ? "[custom]" : "[default]"} ──`,
+          ...cfg.errorPatterns.map(p => `    • ${p}`),
+          "",
+          `  ── Exclude Patterns (${cfg.excludePatterns.length}) ${isCustomExcl ? "[custom]" : "[default]"} ──`,
+          ...cfg.excludePatterns.map(p => `    ✕ ${p}`),
+          "",
+          "  Matching: case-insensitive substring against \"ErrorType: message\"",
+          "  Excludes are checked first. Override via config file.",
+        ];
+        await sendMessage(sessionID, lines.join("\n"));
+        return;
+      }
+
+      // ── Reload (re-read global config from disk) ──
+      if (subcmd === "reload") {
+        const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
+        let fileExists = false;
+        let rawContents = "";
+        try {
+          rawContents = await readFile(configPath, "utf-8");
+          fileExists = true;
+        } catch {
+          // File doesn't exist
+        }
+
+        const reloaded = await loadConfig(directory, log);
+        Object.assign(globalConfig, reloaded);
+        if (!globalConfig.enabled) cancelAllPendingRetries();
+
+        const lines: string[] = [];
+        if (fileExists) {
+          lines.push(
+            "Auto-continue global config reloaded",
+            `  From: ${configPath}`,
+            `  Contents: ${rawContents.trim()}`,
+          );
+        } else {
+          lines.push(
+            "Auto-continue global config reloaded",
+            `  No ${CONFIG_FILE} found at ${configPath} — using defaults`,
+          );
+        }
+
+        lines.push("", ...(await configSummaryLines(sessionID)));
+
+        await sendMessage(sessionID, lines.join("\n"));
+        return;
+      }
+
+      // ── Reset (clear session overrides) ──
+      if (subcmd === "reset") {
+        sessionConfigs.delete(sessionID);
+        await sendMessage(sessionID, "Session overrides cleared. Using global config.");
+        return;
+      }
+
+      // ── Global ──
+      if (subcmd === "global") {
+        const globalSub = args[1]?.toLowerCase() || "";
+
+        if (globalSub === "on" || globalSub === "off") {
+          globalConfig.enabled = globalSub === "on";
+          await writeGlobalConfig();
+          if (!globalConfig.enabled) cancelAllPendingRetries();
+          await sendMessage(
+            sessionID,
+            `Global config: auto-continue ${globalSub === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`,
+          );
+          return;
+        }
+
+        if (globalSub === "throttle" || globalSub === "delay" || globalSub === "max") {
+          const value = parseInt(args[2], 10);
+          if (isNaN(value) || value < 0) {
+            await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue global ${globalSub} <number>`);
+            return;
+          }
+
+          const keyMap: Record<string, keyof Config> = {
+            throttle: "throttleMs",
+            delay: "delayMs",
+            max: "maxConsecutive",
+          };
+          (globalConfig as Partial<Record<keyof Config, unknown>>)[keyMap[globalSub]] = value;
+          await writeGlobalConfig();
+
+          const label =
+            globalSub === "throttle"
+              ? "Throttle"
+              : globalSub === "delay"
+                ? "Delay"
+                : "Max consecutive";
+          const unit = globalSub === "max" ? "" : "ms";
+          await sendMessage(sessionID, `Global config: ${label} set to ${value}${unit}. Written to ${CONFIG_FILE}.`);
+          return;
+        }
+
+        // Global help (no recognized subcommand)
+        const text = [
+          "Usage: /auto-continue global <subcommand>",
+          "",
+          "  on|off              Enable/disable globally",
+          "  throttle <ms>       Set global retry throttle",
+          "  delay <ms>          Set global delay",
+          "  max <n>             Set global max retries (0=unlimited)",
+          "",
+          "  Plugin updates are managed by OpenCode v2 via the `plugins`",
+          "  array in opencode.json(c) — update the package spec and restart.",
+        ].join("\n");
+        await sendMessage(sessionID, text);
+        return;
+      }
+
+      // ── Unknown ──
+      await sendMessage(
+        sessionID,
+        `❌ Unknown: /auto-continue ${args.join(" ")}\nType /auto-continue help for available commands.`,
+      );
     }
 
-    // ── Unknown ──
-    await sendMessage(
-      sessionID,
-      `❌ Unknown: /auto-continue ${args.join(" ")}\nType /auto-continue help for available commands.`,
-    );
-    throw new Error("__AUTO_CONTINUE_HANDLED__");
-  }
+    // ── Registrations ───────────────────────────────────────────────────────
 
-  return {
-    // Register /auto-continue and /ac commands
-    config: async (opencodeConfig: any) => {
-      opencodeConfig.command ??= {};
-      opencodeConfig.command["auto-continue"] = {
-        template: "",
-        description: "Manage auto-continue settings (on/off, throttle, delay, max, reload)",
+    // Register /auto-continue and /ac commands. The executor only renders
+    // output through synthetic messages (resume: false) — it never submits a
+    // prompt, so running a command never triggers a model call.
+    await ctx.command.transform((editor) => {
+      const description = "Manage auto-continue settings (on/off, throttle, delay, max, reload)";
+      const execute = async ({ sessionID, prompt }: { sessionID: string; prompt: { text: string } }) => {
+        await handleCommand(sessionID, prompt.text);
       };
-      opencodeConfig.command["ac"] = {
-        template: "",
-        description: "Manage auto-continue settings (on/off, throttle, delay, max, reload)",
-      };
-    },
+      editor.add({ name: "auto-continue", description, execute });
+      editor.add({ name: "ac", description, execute });
+    });
 
-    // Route both commands to the same handler
-    "command.execute.before": async (input: any, _output: any) => {
-      if (input.command !== "auto-continue" && input.command !== "ac") return;
-      await handleCommand(input);
-    },
-
-    // React to events for auto-continue behavior
-    event: async ({ event }) => {
-      // ── session.error: detect retryable errors ──
-      if (event.type === "session.error") {
-        const props = event.properties as {
-          sessionID?: string;
-          error?: unknown;
-        };
-        const { sessionID, error } = props;
-        if (!sessionID) return;
-
-        const config = getEffectiveConfig(sessionID);
-        if (!config.enabled) return;
-
-        const state = getState(sessionID);
-        if (isExcludedError(error, config)) {
-          if (state.pluginAbortPending) return;
-          state.turn.aborted = true;
-          state.pendingContinue = false;
-          clearIdleTimer(state);
-          clearStalledTimer(state);
-          return;
-        }
-
-        if (isRetryableError(error, config)) {
-          log(`Retryable error in ${sessionID}: ${errorMessage(error)}`);
-          state.lastErrorTime = Date.now();
-          state.pendingContinue = true;
-        }
-      }
-
-      // ── message.updated: detect errors + reset on success ──
-      if (event.type === "message.updated") {
-        const props = event.properties as {
-          info?: {
-            id?: string;
-            sessionID?: string;
-            role?: string;
-            finish?: string;
-            tokens?: { output?: number };
-            error?: unknown;
-            metadata?: { done?: boolean };
-          };
-        };
-        const info = props.info;
-        if (!info?.sessionID) return;
-
-        const state = getState(info.sessionID);
-        if (info.role === "user") {
-          if (info.id === state.userMessageID) return;
-          state.userMessageID = info.id;
-          resetTurn(state);
-          return;
-        }
-        if (info.role !== "assistant") return;
-
-        const config = getEffectiveConfig(info.sessionID);
-        updateAssistantEvidence(state.turn, info);
-        if (hasAssistantActivity(state)) {
-          state.sawAssistantActivity = true;
-          clearStalledTimer(state);
-        }
-
-        if (isExcludedError(info.error, config)) {
-          if (state.pluginAbortPending) return;
-          state.turn.aborted = true;
-          state.pendingContinue = false;
-          clearIdleTimer(state);
-          clearStalledTimer(state);
-          return;
-        }
-
-        // Retryable error on assistant message
-        if (config.enabled && isRetryableError(info.error, config)) {
-          log(`Retryable error on assistant message in ${info.sessionID}: ${errorMessage(info.error)}`);
-          state.lastErrorTime = Date.now();
-          state.pendingContinue = true;
-        }
-
-        // Reset counter on successful completion
-        if ((info.finish === "stop" || info.metadata?.done) && !info.error) {
-          clearIdleTimer(state);
-          clearStalledTimer(state);
-          state.pendingContinue = false;
-          if (state.consecutiveCount > 0) {
-            log(`${info.sessionID} completed successfully, resetting counter`);
-            state.consecutiveCount = 0;
-          }
-        }
-
-        // Some OpenCode versions persist an empty completed response without
-        // emitting session.idle or session.status=idle. Reuse the same guarded
-        // recovery path so the status plugin and auto-continue agree.
-        if (
-          info.finish === "unknown" &&
-          config.retryEmptyResponses &&
-          isCompletedEmptyResponse(state.turn)
-        ) {
-          handleSessionIdle(info.sessionID);
-        }
-      }
-
-      if (event.type === "message.part.updated") {
-        const props = event.properties as {
-          part?: { sessionID?: string; messageID?: string; type?: string; text?: string };
-        };
-        const part = props.part;
-        if (!part?.sessionID) return;
-        const state = getState(part.sessionID);
-        recordTextPart(state.turn, part);
-        const hasPartActivity =
-          ((part.type === "text" || part.type === "reasoning") && Boolean(part.text?.trim())) || part.type === "tool";
-        if (hasPartActivity) {
-          state.sawAssistantActivity = true;
-          clearStalledTimer(state);
-        }
-      }
-
-      const eventType = event.type as string;
-      if (eventType === "session.status") {
-        const props = event.properties as { sessionID?: string; status?: { type?: string } };
-        if (!props.sessionID || !props.status?.type) return;
-        const state = getState(props.sessionID);
-        state.busy = props.status.type === "busy";
-        if (state.busy) {
-          startStalledTimer(props.sessionID, state);
-        } else if (props.status.type === "idle") {
-          handleSessionIdle(props.sessionID);
-        } else {
-          clearStalledTimer(state);
-        }
-      }
-
-      if (
-        eventType === "permission.updated" ||
-        eventType === "permission.asked" ||
-        eventType === "permission.v2.asked" ||
-        eventType === "permission.replied" ||
-        eventType === "permission.v2.replied"
-      ) {
-        const props = event.properties as { sessionID?: string };
-        if (!props.sessionID) return;
-        const state = getState(props.sessionID);
-        state.turn.waitingForPermission = !eventType.endsWith("replied");
-        if (state.turn.waitingForPermission) {
-          state.pendingContinue = false;
-          clearIdleTimer(state);
-          clearStalledTimer(state);
-        }
-      }
-
-      if (
-        eventType === "question.asked" ||
-        eventType === "question.v2.asked" ||
-        eventType === "question.replied" ||
-        eventType === "question.v2.replied" ||
-        eventType === "question.rejected" ||
-        eventType === "question.v2.rejected"
-      ) {
-        const props = event.properties as { sessionID?: string };
-        if (!props.sessionID) return;
-        const state = getState(props.sessionID);
-        state.turn.waitingForQuestion = eventType.endsWith("asked");
-        if (state.turn.waitingForQuestion) {
-          state.pendingContinue = false;
-          clearIdleTimer(state);
-          clearStalledTimer(state);
-        }
-      }
-
-      // ── session.idle: send continue if pending ──
-      if (event.type === "session.idle") {
-        const props = event.properties as { sessionID?: string };
-        const sessionID = props.sessionID;
-        if (!sessionID) return;
-
-        handleSessionIdle(sessionID);
-      }
-    },
-
-    "tool.execute.before": async (input: { sessionID?: string; tool?: string }) => {
-      if (input.tool !== "question" || !input.sessionID) return;
-      const state = getState(input.sessionID);
+    // The question tool blocks the turn on user input — never auto-continue
+    // across it.
+    await ctx.tool.hook("execute.before", (event) => {
+      if (event.tool !== "question" || !event.sessionID) return;
+      const state = getState(event.sessionID);
       state.turn.waitingForQuestion = true;
       state.pendingContinue = false;
       clearIdleTimer(state);
       clearStalledTimer(state);
-    },
+    });
 
-    "tool.execute.after": async (input: { sessionID?: string; tool?: string }) => {
-      if (input.tool !== "question" || !input.sessionID) return;
-      getState(input.sessionID).turn.waitingForQuestion = false;
-    },
+    await ctx.tool.hook("execute.after", (event) => {
+      if (event.tool !== "question" || !event.sessionID) return;
+      getState(event.sessionID).turn.waitingForQuestion = false;
+    });
 
-    dispose: async () => {
+    // Subscribe to the server event stream. State is keyed by sessionID; each
+    // plugin instance only acts on events attributed to its own location.
+    const controller = new AbortController();
+    void (async () => {
+      while (!controller.signal.aborted) {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+            if (isForeignLocation(event)) continue;
+            try {
+              await handleEvent(event);
+            } catch (err) {
+              log(`Error handling ${event.type} event: ${err}`);
+            }
+          }
+          if (controller.signal.aborted) return;
+          log("Event stream ended — resubscribing");
+          await sleep(1_000);
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          log(`Event stream error: ${err} — resubscribing`);
+          await sleep(1_000);
+        }
+      }
+    })();
+
+    return () => {
+      controller.abort();
       for (const state of sessions.values()) {
         clearIdleTimer(state);
         clearStalledTimer(state);
       }
-    },
-  };
-};
+      sessions.clear();
+    };
+  },
+});
 
 export default plugin;

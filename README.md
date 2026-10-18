@@ -1,52 +1,67 @@
 # opencode-auto-continue
 
-OpenCode plugin that automatically sends "continue" when transient errors or completed empty assistant responses occur, allowing sessions to recover and resume without manual intervention. Handles API errors, provider issues, context overflow, connection resets, tool failures, empty provider responses, and more — with configurable safeguards so you control exactly which failures trigger a retry.
+OpenCode **v2** plugin that automatically sends "continue" when transient errors or completed empty assistant responses occur, allowing sessions to recover and resume without manual intervention. Handles API errors, provider issues, context overflow, connection resets, tool failures, empty provider responses, and more — with configurable safeguards so you control exactly which failures trigger a retry.
+
+> **OpenCode v2 required.** This plugin uses the v2 plugin API (`Plugin.define` + `ctx.*` domains) and will not load under OpenCode v1. It is verified against a real OpenCode **2.0.28** host and developed against `@opencode/plugin` 2.0.32. V1 users should stay on the previous 1.x release of this plugin.
 
 <img width="322" height="162" alt="image" src="https://github.com/user-attachments/assets/51726631-5c5c-474a-8fa1-dd69631140c5" />
 
 ## How It Works
 
-1. **Detects recoverable failures**: Listens for explicit errors and completed assistant messages that end with `finish: "unknown"`, zero output tokens, and no text or error.
-2. **Pattern and state matching**: Matches explicit errors against configurable patterns and strictly validates the latest assistant message before treating an empty response as recoverable. User aborts, tool calls, questions, and permission prompts are excluded.
-3. **Waits for idle**: When the session becomes idle after a recoverable failure, rechecks the latest state after the configured delay and sends "continue" via `promptAsync`.
-4. **Recovers stalled requests**: Aborts a request that remains busy for 200 seconds without any real assistant activity, then sends "continue" after the session becomes idle.
-5. **Safety limits**: Configurable throttle and max consecutive retries prevent infinite loops
-6. **Auto-reset**: Consecutive retry counter resets when a message completes successfully
+1. **Detects recoverable failures**: Subscribes to the v2 event stream and watches `session.execution.failed` / `session.step.failed` errors plus completed steps that end with `finish: "unknown"` and zero output tokens (partial text is deliberately still treated as a broken response — see [Completed Empty Responses](#completed-empty-responses)).
+2. **Pattern and state matching**: Matches structured errors against configurable patterns and strictly validates the latest assistant step before treating an empty response as recoverable. User interruptions, tool calls, questions, and permission prompts are excluded.
+3. **Cooperates with OpenCode's built-in retries**: When OpenCode schedules its own provider retry (`session.retry.scheduled`, status `retry`), the plugin stands down and does not double-retry. It acts when retries are exhausted and the turn fails, or when the failure is terminal.
+4. **Waits for idle**: When the session becomes idle after a recoverable failure, rechecks the latest state after the configured delay and sends "continue" via `ctx.session.prompt` (keeping the session's selected agent and model).
+5. **Recovers stalled requests**: Interrupts a request that remains busy for 200 seconds without any real assistant activity (`ctx.session.interrupt`), then sends "continue" after the session becomes idle.
+6. **Safety limits**: Configurable throttle and max consecutive retries prevent infinite loops.
+7. **Auto-reset**: Consecutive retry counter resets when a step completes with `finish: "stop"`.
+
+Each plugin instance only acts on events attributed to its own location — events that carry a foreign project directory (or a foreign workspace, when the plugin itself is workspace-scoped) are ignored.
 
 ## Installation
 
-Add to the `plugin` array in your `opencode.jsonc`:
-
-```
-"opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz",
-```
+Add the package to the `plugins` array in your `opencode.json(c)`:
 
 ```jsonc
 {
-  "plugin": [
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
     "opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz",
     // ... other plugins
   ]
 }
 ```
 
-Restart OpenCode. The plugin is automatically installed and loaded.
+Restart OpenCode. The plugin is automatically installed (via Bun into OpenCode's cache) and loaded.
+
+You can also install from a local checkout — configure the **directory** that contains the `package.json`, never a path to `dist/index.js` (OpenCode rejects file paths with `configured plugin path must be a directory`):
+
+```jsonc
+{
+  "plugins": [
+    "../opencode-auto-continue"
+  ]
+}
+```
+
+### Updating
+
+Plugin versions are managed entirely by OpenCode v2 through the `plugins` array — change the package spec (for example pin a tag or version) and restart. The 1.x-era `/ac global update` cache-wipe command was removed because it deleted OpenCode's global cache/config/data directories; updating that way is no longer needed or supported.
 
 ## Commands
 
-The plugin registers `/auto-continue` (and `/ac` as a shorthand alias) for managing settings at runtime.
+The plugin registers `/auto-continue` (and `/ac` as a shorthand alias) for managing settings at runtime. Command output is rendered as synthetic chat messages and never triggers a model call.
 
 ### Quick Reference
 
 | Command | Description |
 |---------|-------------|
-| `/auto-continue` | Show help menu with current status and version check |
+| `/auto-continue` | Show help menu with current status |
 | `/auto-continue on\|off` | Enable/disable for current session |
 | `/auto-continue throttle <ms>` | Set retry throttle (session) |
 | `/auto-continue delay <ms>` | Set delay before sending continue (session) |
 | `/auto-continue max <n>` | Set max consecutive retries (session) |
-| `/auto-continue update-throttle <ms>` | Set update throttle (session) |
-| `/auto-continue status` | Show full status, config details, and version check |
+| `/auto-continue status` | Show full status and config details |
 | `/auto-continue patterns` | Show all active error match/exclude patterns |
 | `/auto-continue reload` | Reload global config from disk |
 | `/auto-continue reset` | Clear session overrides, revert to global |
@@ -54,17 +69,14 @@ The plugin registers `/auto-continue` (and `/ac` as a shorthand alias) for manag
 | `/auto-continue global throttle <ms>` | Set global retry throttle (writes config) |
 | `/auto-continue global delay <ms>` | Set global delay (writes config) |
 | `/auto-continue global max <n>` | Set global max retries (writes config) |
-| `/auto-continue global update-throttle <ms>` | Set global update throttle (writes config) |
-| `/auto-continue global update` | Clear cache to fetch latest version |
 
-All commands also work with `/ac` (e.g., `/ac status`, `/ac on`, `/ac global update`).
+All commands also work with `/ac` (e.g., `/ac status`, `/ac on`, `/ac global off`).
 
 ### Session vs Global
 
-- **Session commands** (`on`, `off`, `throttle`, `delay`, `max`, `update-throttle`) change settings for the current session only. They override global settings and are lost when the session ends.
-- **Global commands** (`global on`, `global off`, `global throttle`, `global update-throttle`, etc.) write to the config file on disk, affecting all future sessions.
+- **Session commands** (`on`, `off`, `throttle`, `delay`, `max`) change settings for the current session only. They override global settings and are lost when the session ends. Disabling a session (`off`) immediately cancels any queued retry for it.
+- **Global commands** (`global on`, `global off`, `global throttle`, `global delay`, `global max`) write to the config file on disk, affecting all future sessions. `global off` cancels queued retries in every session.
 - **`reload`** re-reads the config file from disk into the running plugin (useful if you edited the file manually).
-- **`global update`** clears the cached module so the latest version is re-fetched from the `latest` tag on next restart.
 - **`reset`** clears session overrides so the session falls back to global config.
 
 ## Configuration (Optional)
@@ -78,7 +90,7 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
   // Retry throttle: minimum ms between auto-continues for the same session
   "throttleMs": 5000,
 
-  // Delay after session becomes idle before sending continue
+  // Delay after the session becomes idle before sending continue
   "delayMs": 500,
 
   // Max consecutive auto-continues per session before giving up (0 = unlimited)
@@ -87,19 +99,17 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
   // Set to false to disable the plugin without removing it
   "enabled": true,
 
-  // Retry finish="unknown" assistant responses with zero output and no text/error
+  // Retry finish="unknown" assistant responses with zero output tokens
+  // and no error (partial text does not block the retry)
   "retryEmptyResponses": true,
 
-  // Abort and retry after 200 seconds with no text, reasoning, tool call, or output token
-  // Set to 0 to disable stalled-request recovery
-  "stalledRequestTimeoutMs": 200000,
-
-  // Update throttle: minimum ms between remote version checks.
-  // The plugin only checks for new versions when you run /ac, /ac status,
-  // or /auto-continue — this controls how often that check hits GitHub.
-  "updateThrottleMs": 30000
+  // Interrupt and retry after 200 seconds with no text, reasoning, tool call,
+  // or output token. Set to 0 to disable stalled-request recovery
+  "stalledRequestTimeoutMs": 200000
 }
 ```
+
+> **Migrating from the 1.x config?** The file name and location are unchanged, and all settings above keep their meaning. The 1.x-only keys `updateThrottleMs` and `offlineMode` no longer exist (the remote version check was removed along with self-update); they are ignored if still present, and it is safe to delete them.
 
 ### Settings Reference
 
@@ -109,9 +119,8 @@ Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The follow
 | `delayMs` | number | `500` | Delay after session idle before sending continue |
 | `maxConsecutive` | number | `5` | Max consecutive auto-continues before giving up (0 = unlimited) |
 | `enabled` | boolean | `true` | Set `false` to disable without removing from plugin list |
-| `retryEmptyResponses` | boolean | `true` | Retry strict completed empty assistant responses without an explicit error |
-| `stalledRequestTimeoutMs` | number | `200000` | Abort and retry a busy request with no real assistant activity after this delay (0 disables) |
-| `updateThrottleMs` | number | `30000` | Update throttle: minimum ms between remote version checks |
+| `retryEmptyResponses` | boolean | `true` | Retry completed zero-output assistant responses (`finish: "unknown"`, no error) without an explicit failure |
+| `stalledRequestTimeoutMs` | number | `200000` | Interrupt and retry a busy request with no real assistant activity after this delay (0 disables) |
 | `errorPatterns` | string[] | *(see below)* | Error substrings that trigger auto-continue (case-insensitive) |
 | `excludePatterns` | string[] | *(see below)* | Error substrings that **never** trigger auto-continue (checked first) |
 
@@ -119,63 +128,60 @@ All fields are optional — omitted keys use the defaults shown above. You can a
 
 ### Completed Empty Responses
 
-Some providers can finish a request without emitting an explicit error or a usable assistant response. The plugin treats this as recoverable only when the latest assistant message has all of the following properties when the session becomes idle:
+Some providers can finish a request without emitting an explicit error or a usable assistant response. The plugin treats this as recoverable only when the latest assistant step has all of the following properties when the session becomes idle:
 
 - `finish` is exactly `"unknown"`
 - output token count is `0`
-- no non-empty text part was emitted for that assistant message
-- no assistant or session error was reported
-- the turn was not user-aborted
+- no error was reported for the step
+- the turn was not interrupted by the user
 - the session is not waiting for a question answer or permission reply
 
-The existing `delayMs`, `throttleMs`, and `maxConsecutive` limits apply. A late successful `finish: "stop"` event cancels a queued retry, and a successful stop resets the consecutive retry counter. Set `retryEmptyResponses` to `false` to retain error-only behavior.
+Partial text is deliberately **not** excluded: an `unknown` finish with zero billed output tokens indicates a broken stream even when some text was emitted, so those responses are retried as well (this matches the 1.x behavior).
+
+The existing `delayMs`, `throttleMs`, and `maxConsecutive` limits apply. A late successful `finish: "stop"` step cancels a queued retry, and a successful stop resets the consecutive retry counter. Set `retryEmptyResponses` to `false` to retain error-only behavior.
 
 ### Stalled Requests
 
-The plugin starts a watchdog when a session becomes busy. If the request remains busy for `stalledRequestTimeoutMs` without emitting non-empty text, reasoning, a tool call, or any output token, the plugin calls OpenCode's session abort API and sends "continue" after the session becomes idle.
+The plugin starts a watchdog when a session becomes busy. If the request remains busy for `stalledRequestTimeoutMs` without emitting non-empty text, reasoning, a tool call, or any output token, the plugin interrupts the session (`ctx.session.interrupt` with `resume: false`) and sends "continue" after the session becomes idle.
 
-The default timeout is 200 seconds. Once real assistant activity begins, the watchdog is cancelled, so it does not impose a total-duration limit on long responses or tool executions. User-initiated aborts, questions, and permission prompts remain excluded from automatic recovery. Set `stalledRequestTimeoutMs` to `0` to disable this behavior.
+The default timeout is 200 seconds. Once real assistant activity begins, the watchdog is cancelled, so it does not impose a total-duration limit on long responses or tool executions. User-initiated interruptions, questions, and permission prompts remain excluded from automatic recovery. Set `stalledRequestTimeoutMs` to `0` to disable this behavior.
 
 ### Error Patterns
 
-The plugin matches each error against a list of patterns. The error is formatted as `"ErrorName: error message"` and each pattern is matched as a case-insensitive substring.
+The plugin matches each error against a list of patterns. OpenCode v2 reports structured errors like `{ type: "provider.transport", message: "SSE read timed out" }`; the plugin formats each error as `"ErrorType: error message"` and matches every pattern as a case-insensitive substring — so both the structured type and the provider's raw message text are matchable.
 
 **Exclude patterns are checked first** — if any exclude pattern matches, the error is never retried, even if a match pattern also matches.
 
 Run `/ac patterns` to see the full list of active patterns at any time.
 
-#### Default Match Patterns (19)
+#### Default Match Patterns (26)
 
-These cover the most common transient errors observed across OpenCode sessions:
+Structured v2 error types:
 
 | Pattern | Catches |
 |---------|---------|
-| `bad request` | APIError 400 responses |
-| `reasoning_opaque` | Multiple reasoning values in single response |
-| `prefill` | Assistant message prefill not supported |
-| `SSE read timed out` | Server-sent event stream timeouts |
-| `DecimalError` | Invalid decimal argument errors |
-| `ContextOverflowError` | Session too large to compact |
-| `too large to compact` | Context exceeds model limit after stripping |
-| `Invalid diff` | Malformed diff in tool output |
-| `Tool execution aborted` | Tool execution failures |
-| `JSON parsing failed` | JSON parse errors in tool responses |
-| `Invalid input for tool` | Bad tool input validation |
-| `tried to call unavailable tool` | Tool not available |
-| `finding less tool calls` | Tool call count mismatch |
-| `tool_use ids were found without tool_result` | Missing tool results |
-| `ECONNREFUSED` | Connection refused (mid-stream) |
-| `ECONNRESET` | Connection reset (mid-stream) |
-| `idle timeout` | Idle timeout on connection |
-| `no data received` | Empty response from provider |
-| `expected string, received undefined` | Type validation errors |
+| `provider.invalid-request` | HTTP 400s and classified invalid requests (includes context-overflow classifications) |
+| `provider.invalid-output` | Incomplete or invalid provider output streams |
+| `provider.transport` | Connection resets, refused connections, SSE failures |
+| `provider.timeout` | Request timeouts |
+| `provider.internal` | Provider-side (5xx) failures |
+| `provider.unknown` | Unrecognized transient provider failures |
+| `tool.execution` | Tool failures that terminate a step |
+
+Message-text patterns carried over from 1.x (they still match against the raw provider/tool message):
+
+`bad request`, `reasoning_opaque`, `prefill`, `SSE read timed out`, `DecimalError`, `ContextOverflowError`, `too large to compact`, `Invalid diff`, `Tool execution aborted`, `JSON parsing failed`, `Invalid input for tool`, `tried to call unavailable tool`, `finding less tool calls`, `tool_use ids were found without tool_result`, `ECONNREFUSED`, `ECONNRESET`, `idle timeout`, `no data received`, `expected string, received undefined`.
+
+Note that OpenCode v2 feeds most ordinary tool failures back to the model as tool results instead of failing the turn; the tool patterns above only matter for tool errors that actually terminate a step.
 
 #### Default Exclude Patterns (2)
 
 | Pattern | Why excluded |
 |---------|-------------|
-| `MessageAbortedError` | User-initiated abort (Ctrl+C / stop button) |
-| `operation was aborted` | Catches abort messages regardless of error name |
+| `MessageAbortedError` | Legacy abort error name |
+| `operation was aborted` | Catches abort messages regardless of error type |
+
+User interruptions in v2 usually surface as `session.execution.interrupted` events rather than errors; the plugin never auto-continues those regardless of patterns.
 
 #### Custom Patterns
 
@@ -185,8 +191,8 @@ To override the defaults, add `errorPatterns` and/or `excludePatterns` to your c
 {
   // Replace ALL default match patterns with your own
   "errorPatterns": [
-    "bad request",
-    "reasoning_opaque",
+    "provider.invalid-request",
+    "provider.transport",
     "my custom error"
   ],
 
@@ -200,17 +206,18 @@ To override the defaults, add `errorPatterns` and/or `excludePatterns` to your c
 
 **Note:** Setting `errorPatterns` or `excludePatterns` in the config replaces the entire default list, not appends to it. Include any defaults you want to keep. When these fields are omitted, the built-in defaults are used and are **not** written to the config file.
 
+## What changed in the v2 migration
+
+- **Plugin API**: the plugin now default-exports `Plugin.define({ id, setup(ctx) })` from `@opencode/plugin` instead of a v1 hook object. `setup` returns a cleanup function that cancels timers and the event subscription when the plugin unloads.
+- **Events**: v1 `session.error` / `message.updated` / `message.part.updated` do not exist in v2. The plugin now follows `session.execution.*`, `session.step.*`, `session.text.*`, `session.tool.*`, `session.status`, `session.idle`, `permission.*`, `form.*` (the v2 question mechanism), and `session.deleted` (per-session state is now cleaned up on deletion).
+- **Built-in retries**: v2 retries provider failures itself. The plugin waits for those retries to finish before acting, and stands down while a retry is scheduled.
+- **Commands**: `/auto-continue` and `/ac` are registered through `ctx.command.transform`; the v1 `command.execute.before` short-circuit hack is gone. Command output uses `ctx.session.synthetic` with `resume: false` — display-only, no model call.
+- **Self-update removed**: the 1.x remote version check and `/ac global update [force]` cache-wipe machinery were removed. Updates are handled by OpenCode v2's plugin package management.
+- **Location scoping**: events that carry a location different from the plugin's own are ignored.
+
 ## Logs
 
-The plugin logs all activity with the `[opencode-auto-continue]` prefix:
-
-```
-[opencode-auto-continue] No config file at /home/user/.opencode/opencode-auto-continue.jsonc, using defaults
-[opencode-auto-continue] Retryable error in abc123: Multiple reasoning_opaque values received...
-[opencode-auto-continue] abc123 idle with pending continue, waiting 500ms...
-[opencode-auto-continue] Sending "continue" to abc123 (attempt 1/5)
-[opencode-auto-continue] Successfully sent "continue" to abc123
-```
+The plugin is intentionally silent: it does not write to the TUI outside of the `/ac` command output. Use `/ac status` to inspect current settings and per-session retry state.
 
 ## Building from Source
 
@@ -218,8 +225,11 @@ The plugin logs all activity with the `[opencode-auto-continue]` prefix:
 git clone https://github.com/developing-today/opencode-auto-continue.git
 cd opencode-auto-continue
 bun install
-bun run build
+bun run build   # emits dist/
+bun test        # unit tests (no model calls)
 ```
+
+The published package loads `dist/index.js` through the `exports` field; `@opencode/plugin` is a regular dependency (`^2.0.28`).
 
 ## License
 
