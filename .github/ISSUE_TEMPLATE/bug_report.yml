@@ -1,0 +1,97 @@
+name: Bug report
+description: Report a problem with opencode-auto-continue
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. Please include enough detail to reproduce it.
+
+  - type: input
+    id: opencode-version
+    attributes:
+      label: OpenCode version
+      description: Output of `opencode --version`.
+      placeholder: 2.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version or commit
+      description: The version in the installed `package.json`, or the commit shown in the plugin list.
+      placeholder: 2.0.0 or 9e00f86
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Describe the behaviour you saw.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: Describe what should have happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps, including the prompts or commands you used.
+      placeholder: |
+        1. Start OpenCode with the plugin enabled
+        2. Send a prompt
+        3. Wait for the turn to finish
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Plugin configuration
+      description: Contents of `.opencode/opencode-auto-continue.jsonc`, if you use one.
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or session output
+      description: Relevant output from the TUI or `opencode` logs. Remove API keys and personal paths.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I am using the latest version of the plugin.
+          required: true
+        - label: I searched the existing issues for the same problem.
+          required: true
+        - label: I removed unrelated plugins while reproducing the problem.
+          required: false

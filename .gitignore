@@ -7,6 +7,4 @@ bun.lock
 .opencode/**/ses_*/**.json
 .opencode/**/*_ses_*.json
 .opencode/**/ses_*.json
-thoughts/**/ses_*/**.json
-thoughts/**/*_ses_*.json
-thoughts/**/ses_*.json
+thoughts/

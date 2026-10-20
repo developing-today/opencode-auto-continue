@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="opencode-auto-continue">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0d1117"/>
+  <rect x="1" y="1" width="126" height="126" rx="27" fill="none" stroke="#30363d" stroke-width="2"/>
+  <path d="M64 26a38 38 0 1 0 38 38" fill="none" stroke="#58a6ff" stroke-width="9" stroke-linecap="round" marker-end="url(#arrow)"/>
+  <path d="M48 52l14 12-14 12" fill="none" stroke="#e6edf3" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M66 76h14" stroke="#e6edf3" stroke-width="7" stroke-linecap="round"/>
+</svg>

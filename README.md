@@ -1,197 +1,153 @@
-# opencode-auto-continue
+<p align="center">
+  <img src=".github/assets/logo.svg" width="112" height="112" alt="opencode-auto-continue logo">
+</p>
 
-OpenCode plugin that automatically sends "continue" when transient errors occur, allowing sessions to recover and resume without manual intervention. Handles API errors, provider issues, context overflow, connection resets, tool failures, and more — with configurable error patterns so you control exactly which errors trigger a retry.
+<h1 align="center">opencode-auto-continue</h1>
 
-<img width="322" height="162" alt="image" src="https://github.com/user-attachments/assets/51726631-5c5c-474a-8fa1-dd69631140c5" />
+<p align="center">Keeps an OpenCode session moving when the agent stops.</p>
 
-## How It Works
+<p align="center">
+  <img alt="OpenCode 2" src="https://img.shields.io/badge/OpenCode-2.x-58a6ff">
+  <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-3fb950">
+</p>
 
-1. **Detects errors**: Listens for `session.error` and `message.updated` events
-2. **Pattern matching**: Matches error name + message against configurable patterns (case-insensitive substrings). Exclude patterns are checked first to prevent retrying user-initiated aborts.
-3. **Waits for idle**: When the session becomes idle after a matched error, sends "continue" via `promptAsync`
-4. **Safety limits**: Configurable throttle and max consecutive retries prevent infinite loops
-5. **Auto-reset**: Consecutive retry counter resets when a message completes successfully
+## Why
+
+Every OpenCode turn ends with the agent idle. On a long task that means either noticing the stop and typing `continue`, or leaving the work half done. This plugin sends the continue for you once the execution has genuinely finished.
+
+## What it does
+
+1. Watches for an execution to finish (`session.execution.succeeded` or `session.execution.failed`).
+2. Waits `delayMs` so a prompt already queued by the user starts first.
+3. Sends `continue`.
+4. Repeats when the next execution finishes.
+
+It stays out of the way when:
+
+- the user interrupted the session — it resumes only after the user starts a new turn;
+- a permission request is waiting for an answer;
+- the session is a child session created by a subagent;
+- the turn came from a `/ac` command rather than the agent;
+- three executions in a row have failed;
+- the consecutive limit or throttle has been reached.
+
+## Requirements
+
+- OpenCode 2.
+- A model and provider configured in OpenCode.
+- The plugin installed in a project or in the global plugin directory.
 
 ## Installation
 
-Add to the `plugin` array in your `opencode.jsonc`:
-
-```
-"opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz",
-```
+Add the package to the `plugins` array in `opencode.jsonc`:
 
 ```jsonc
 {
-  "plugin": [
-    "opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz",
-    // ... other plugins
+  "plugins": [
+    "opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz"
   ]
 }
 ```
 
-Restart OpenCode. The plugin is automatically installed and loaded.
+Restart the OpenCode service so the plugin is loaded. Restarting only the terminal interface does not reload plugins:
 
-## Commands
-
-The plugin registers `/auto-continue` (and `/ac` as a shorthand alias) for managing settings at runtime.
-
-### Quick Reference
-
-| Command | Description |
-|---------|-------------|
-| `/auto-continue` | Show help menu with current status and version check |
-| `/auto-continue on\|off` | Enable/disable for current session |
-| `/auto-continue throttle <ms>` | Set retry throttle (session) |
-| `/auto-continue delay <ms>` | Set delay before sending continue (session) |
-| `/auto-continue max <n>` | Set max consecutive retries (session) |
-| `/auto-continue update-throttle <ms>` | Set update throttle (session) |
-| `/auto-continue status` | Show full status, config details, and version check |
-| `/auto-continue patterns` | Show all active error match/exclude patterns |
-| `/auto-continue reload` | Reload global config from disk |
-| `/auto-continue reset` | Clear session overrides, revert to global |
-| `/auto-continue global on\|off` | Enable/disable globally (writes config) |
-| `/auto-continue global throttle <ms>` | Set global retry throttle (writes config) |
-| `/auto-continue global delay <ms>` | Set global delay (writes config) |
-| `/auto-continue global max <n>` | Set global max retries (writes config) |
-| `/auto-continue global update-throttle <ms>` | Set global update throttle (writes config) |
-| `/auto-continue global update` | Clear cache to fetch latest version |
-
-All commands also work with `/ac` (e.g., `/ac status`, `/ac on`, `/ac global update`).
-
-### Session vs Global
-
-- **Session commands** (`on`, `off`, `throttle`, `delay`, `max`, `update-throttle`) change settings for the current session only. They override global settings and are lost when the session ends.
-- **Global commands** (`global on`, `global off`, `global throttle`, `global update-throttle`, etc.) write to the config file on disk, affecting all future sessions.
-- **`reload`** re-reads the config file from disk into the running plugin (useful if you edited the file manually).
-- **`global update`** clears the cached module so the latest version is re-fetched from the `latest` tag on next restart.
-- **`reset`** clears session overrides so the session falls back to global config.
-
-## Configuration (Optional)
-
-A config file is **not required**. The plugin works out of the box with sensible defaults. You only need a config file if you want to change the defaults without using the `/auto-continue global` command.
-
-Create `opencode-auto-continue.jsonc` in your `.opencode/` directory. The following shows the current defaults — you only need to include the settings you want to change:
-
-```jsonc
-{
-  // Retry throttle: minimum ms between auto-continues for the same session
-  "throttleMs": 5000,
-
-  // Delay after session becomes idle before sending continue
-  "delayMs": 500,
-
-  // Max consecutive auto-continues per session before giving up (0 = unlimited)
-  "maxConsecutive": 5,
-
-  // Set to false to disable the plugin without removing it
-  "enabled": true,
-
-  // Update throttle: minimum ms between remote version checks.
-  // The plugin only checks for new versions when you run /ac, /ac status,
-  // or /auto-continue — this controls how often that check hits GitHub.
-  "updateThrottleMs": 30000
-}
+```bash
+opencode service restart
 ```
 
-### Settings Reference
+### From source
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `throttleMs` | number | `5000` | Retry throttle: minimum ms between auto-continues per session |
-| `delayMs` | number | `500` | Delay after session idle before sending continue |
-| `maxConsecutive` | number | `5` | Max consecutive auto-continues before giving up (0 = unlimited) |
-| `enabled` | boolean | `true` | Set `false` to disable without removing from plugin list |
-| `updateThrottleMs` | number | `30000` | Update throttle: minimum ms between remote version checks |
-| `errorPatterns` | string[] | *(see below)* | Error substrings that trigger auto-continue (case-insensitive) |
-| `excludePatterns` | string[] | *(see below)* | Error substrings that **never** trigger auto-continue (checked first) |
-
-All fields are optional — omitted keys use the defaults shown above. You can also manage timing settings at runtime via `/auto-continue global <setting> <value>`.
-
-### Error Patterns
-
-The plugin matches each error against a list of patterns. The error is formatted as `"ErrorName: error message"` and each pattern is matched as a case-insensitive substring.
-
-**Exclude patterns are checked first** — if any exclude pattern matches, the error is never retried, even if a match pattern also matches.
-
-Run `/ac patterns` to see the full list of active patterns at any time.
-
-#### Default Match Patterns (19)
-
-These cover the most common transient errors observed across OpenCode sessions:
-
-| Pattern | Catches |
-|---------|---------|
-| `bad request` | APIError 400 responses |
-| `reasoning_opaque` | Multiple reasoning values in single response |
-| `prefill` | Assistant message prefill not supported |
-| `SSE read timed out` | Server-sent event stream timeouts |
-| `DecimalError` | Invalid decimal argument errors |
-| `ContextOverflowError` | Session too large to compact |
-| `too large to compact` | Context exceeds model limit after stripping |
-| `Invalid diff` | Malformed diff in tool output |
-| `Tool execution aborted` | Tool execution failures |
-| `JSON parsing failed` | JSON parse errors in tool responses |
-| `Invalid input for tool` | Bad tool input validation |
-| `tried to call unavailable tool` | Tool not available |
-| `finding less tool calls` | Tool call count mismatch |
-| `tool_use ids were found without tool_result` | Missing tool results |
-| `ECONNREFUSED` | Connection refused (mid-stream) |
-| `ECONNRESET` | Connection reset (mid-stream) |
-| `idle timeout` | Idle timeout on connection |
-| `no data received` | Empty response from provider |
-| `expected string, received undefined` | Type validation errors |
-
-#### Default Exclude Patterns (2)
-
-| Pattern | Why excluded |
-|---------|-------------|
-| `MessageAbortedError` | User-initiated abort (Ctrl+C / stop button) |
-| `operation was aborted` | Catches abort messages regardless of error name |
-
-#### Custom Patterns
-
-To override the defaults, add `errorPatterns` and/or `excludePatterns` to your config file:
-
-```jsonc
-{
-  // Replace ALL default match patterns with your own
-  "errorPatterns": [
-    "bad request",
-    "reasoning_opaque",
-    "my custom error"
-  ],
-
-  // Replace ALL default exclude patterns with your own
-  "excludePatterns": [
-    "MessageAbortedError",
-    "operation was aborted"
-  ]
-}
-```
-
-**Note:** Setting `errorPatterns` or `excludePatterns` in the config replaces the entire default list, not appends to it. Include any defaults you want to keep. When these fields are omitted, the built-in defaults are used and are **not** written to the config file.
-
-## Logs
-
-The plugin logs all activity with the `[opencode-auto-continue]` prefix:
-
-```
-[opencode-auto-continue] No config file at /home/user/.opencode/opencode-auto-continue.jsonc, using defaults
-[opencode-auto-continue] Retryable error in abc123: Multiple reasoning_opaque values received...
-[opencode-auto-continue] abc123 idle with pending continue, waiting 500ms...
-[opencode-auto-continue] Sending "continue" to abc123 (attempt 1/5)
-[opencode-auto-continue] Successfully sent "continue" to abc123
-```
-
-## Building from Source
+Build the package and point a local plugin file at the result:
 
 ```bash
 git clone https://github.com/developing-today/opencode-auto-continue.git
 cd opencode-auto-continue
-bun install
-bun run build
+npm install
+npm run build
 ```
+
+Create `~/.config/opencode/plugins/opencode-auto-continue.js`:
+
+```js
+export { default } from "file:///absolute/path/to/opencode-auto-continue/dist/index.js";
+```
+
+The file path must be absolute.
+
+## Commands
+
+`/auto-continue` and `/ac` are equivalent.
+
+| Command | Description |
+|---------|-------------|
+| `/ac` | Show current settings and state |
+| `/ac status` | Same as `/ac` |
+| `/ac on` | Enable continuation for the current session |
+| `/ac off` | Disable continuation for the current session |
+| `/ac reset` | Clear the consecutive counter and allow continuing again |
+
+Session settings live in memory and end with the session. Use the config file to change the defaults.
+
+## Configuration
+
+Create `opencode-auto-continue.jsonc` in the project's `.opencode/` directory. Every field is optional.
+
+```jsonc
+{
+  // Send continue this long after an execution finishes.
+  "delayMs": 1000,
+
+  // Minimum time between two auto-continues in the same session.
+  "throttleMs": 5000,
+
+  // Stop after this many continues without a user turn. 0 means no limit.
+  "maxConsecutive": 0,
+
+  // Set false to disable the plugin without removing it.
+  "enabled": true
+}
+```
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `delayMs` | number | `1000` | Delay after an execution finishes before sending `continue` |
+| `throttleMs` | number | `5000` | Minimum time between auto-continues in one session |
+| `maxConsecutive` | number | `0` | Consecutive continue limit, `0` for unlimited |
+| `enabled` | boolean | `true` | Default state for new sessions |
+
+Invalid values are clamped to finite, non-negative numbers.
+
+## Safety limits
+
+- **Three failed executions in a row stop the plugin** for that session instead of retrying a broken provider. A successful turn or a user message resets the count.
+- **The `/ac` command's own turn does not trigger a continue**, so checking status cannot start a loop.
+- **Pending timers are cleared when the plugin unloads**, so a disposed plugin cannot send a prompt.
+- **`maxConsecutive`** caps a long autonomous run. `0` means unlimited, which is useful for unattended work and expensive if left running.
+
+## Stopping it
+
+Press Esc to interrupt the current turn. The plugin does not restart the session until you send a message yourself. Run `/ac off` to disable it for the rest of the session, or set `"enabled": false` in the config file for every session.
+
+## Troubleshooting
+
+**The plugin is not listed.** Check `opencode plugin list` and restart the service. A local plugin file must export the built module and use an absolute path.
+
+**The session never resumes.** Confirm the session produced `session.execution.succeeded` events. This plugin does not wait for `session.idle`: OpenCode 2 does not emit it.
+
+**The `/ac` commands are missing.** The plugin registers them, but the terminal interface caches its command list. Close and reopen the interface after the service restart.
+
+**It continues when you did not want it to.** Run `/ac off`, press Esc, or set `maxConsecutive` to a finite number.
+
+## Development
+
+```bash
+npm install
+npm run build
+npx tsc --noEmit
+```
+
+The package targets the OpenCode 2 plugin API and depends on `@opencode/plugin`.
 
 ## License
 
-MIT
+MIT.

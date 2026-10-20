@@ -1,1133 +1,243 @@
-import { access, lstat, mkdir, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-const PLUGIN_NAME = "opencode-auto-continue";
-const CONFIG_DIR = ".opencode";
-const CONFIG_FILE = `${PLUGIN_NAME}.jsonc`;
-const GITHUB_REPO = "developing-today/opencode-auto-continue";
-const GITHUB_API_COMMITS = `https://api.github.com/repos/${GITHUB_REPO}/commits/main`;
-const GITHUB_API_RELEASE = `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/latest`;
-const LOADED_COMMIT_FILE = "auto-continue-loaded-commit";
-function getOpencodeDirs() {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const xdgConfig = process.env.XDG_CONFIG_HOME || join(home, ".config");
-    const xdgCache = process.env.XDG_CACHE_HOME || join(home, ".cache");
-    const xdgData = process.env.XDG_DATA_HOME || join(home, ".local", "share");
-    const xdgState = process.env.XDG_STATE_HOME || join(home, ".local", "state");
-    return {
-        home,
-        config: join(xdgConfig, "opencode"),
-        cache: join(xdgCache, "opencode"),
-        data: join(xdgData, "opencode"),
-        state: join(xdgState, "opencode"),
-    };
-}
-/** All platform-specific bun cache directories */
-function getBunCacheDirs() {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const xdgCache = process.env.XDG_CACHE_HOME || join(home, ".cache");
-    const dirs = [];
-    // macOS: ~/Library/Caches/bun
-    if (process.platform === "darwin") {
-        dirs.push(join(home, "Library", "Caches", "bun"));
-    }
-    // Linux / XDG: ~/.cache/.bun
-    dirs.push(join(xdgCache, ".bun"));
-    // Older bun versions: ~/.bun/install/cache
-    dirs.push(join(home, ".bun", "install", "cache"));
-    return dirs;
-}
-/** npm/arborist cache directory */
-function getNpmCacheDir() {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    return process.env.npm_config_cache || join(home, ".npm");
-}
-// ─── Content hash from lock files ───────────────────────────────────────────
-/** Extract sha512 integrity hash for this plugin from a bun.lock file */
-function readHashFromBunLock(raw) {
-    const pattern = new RegExp(`"${PLUGIN_NAME}":\\s*\\[.*?,\\s*"(sha512-[^"]+)"`);
-    const match = raw.match(pattern);
-    return match?.[1] ?? null;
-}
-/** Extract integrity hash for this plugin from a package-lock.json (arborist/npm) */
-function readHashFromNpmLock(raw) {
-    try {
-        const lock = JSON.parse(raw);
-        const packages = lock.packages || {};
-        for (const [key, val] of Object.entries(packages)) {
-            if (key.includes(PLUGIN_NAME) && val?.integrity) {
-                return val.integrity;
-            }
-        }
-    }
-    catch { }
-    return null;
-}
-function shortHash(hash) {
-    const body = hash.startsWith("sha512-") ? hash.slice(7) : hash;
-    return body.slice(0, 12);
-}
-/**
- * Search all possible lock file locations for this plugin's installed hash.
- *
- * OpenCode uses @npmcli/arborist (npm) to install plugins into
- * <xdgCache>/opencode/packages/<sanitized-spec>/, creating package-lock.json.
- * It also installs SDK deps into <xdgConfig>/opencode/ which may create
- * bun.lock or package-lock.json. We search all known locations.
- */
-async function readInstalledHash() {
-    const { config, cache } = getOpencodeDirs();
-    // 1. Search cache/packages/ for plugin-specific lock files (arborist installs here)
-    try {
-        const packagesDir = join(cache, "packages");
-        const entries = await readdir(packagesDir);
-        for (const entry of entries) {
-            if (!entry.startsWith(PLUGIN_NAME))
-                continue;
-            const hash = await searchDirForHash(join(packagesDir, entry));
-            if (hash)
-                return hash;
-        }
-    }
-    catch { }
-    // 2. Config dir lock files (SDK deps, may contain plugin if installed there)
-    for (const dir of [config, cache]) {
-        for (const { name, reader } of [
-            { name: "package-lock.json", reader: readHashFromNpmLock },
-            { name: "bun.lock", reader: readHashFromBunLock },
-        ]) {
-            try {
-                const raw = await readFile(join(dir, name), "utf-8");
-                const hash = reader(raw);
-                if (hash)
-                    return hash;
-            }
-            catch { }
-        }
-    }
-    return null;
-}
-/** Recursively search a directory tree for lock files containing our plugin hash */
-async function searchDirForHash(dir, depth = 0) {
-    if (depth > 15)
-        return null;
-    try {
-        const entries = await readdir(dir, { withFileTypes: true });
-        // Check lock files in this directory first
-        for (const entry of entries) {
-            if (!entry.isFile())
-                continue;
-            if (entry.name === "package-lock.json" || entry.name === ".package-lock.json") {
-                try {
-                    const raw = await readFile(join(dir, entry.name), "utf-8");
-                    const hash = readHashFromNpmLock(raw);
-                    if (hash)
-                        return hash;
-                }
-                catch { }
-            }
-            if (entry.name === "bun.lock") {
-                try {
-                    const raw = await readFile(join(dir, entry.name), "utf-8");
-                    const hash = readHashFromBunLock(raw);
-                    if (hash)
-                        return hash;
-                }
-                catch { }
-            }
-        }
-        // Recurse into subdirectories (arborist URL specs create nested dirs)
-        for (const entry of entries) {
-            if (!entry.isDirectory())
-                continue;
-            const hash = await searchDirForHash(join(dir, entry.name), depth + 1);
-            if (hash)
-                return hash;
-        }
-    }
-    catch { }
-    return null;
-}
-// ─── Persistent loaded-commit cache ─────────────────────────────────────────
-// Stores the commit SHA associated with the loaded content hash so it survives
-// restarts. Lives in the XDG cache dir and gets wiped by /ac global update.
-async function readLoadedCommitFile() {
-    try {
-        const { cache } = getOpencodeDirs();
-        const content = await readFile(join(cache, LOADED_COMMIT_FILE), "utf-8");
-        const lines = content.trim().split("\n");
-        if (lines.length >= 2 && lines[0] && lines[1]) {
-            return { hash: lines[0], commitSha: lines[1] };
-        }
-    }
-    catch { }
-    return null;
-}
-async function writeLoadedCommitFile(hash, commitSha) {
-    try {
-        const { cache } = getOpencodeDirs();
-        await mkdir(cache, { recursive: true });
-        await writeFile(join(cache, LOADED_COMMIT_FILE), `${hash}\n${commitSha}\n`, "utf-8");
-    }
-    catch { }
-}
-// ─── Default retryable error patterns ───────────────────────────────────────
-// Matched case-insensitively against "${errorName}: ${errorMessage}".
-// Override via config file's "errorPatterns" array.
-const DEFAULT_ERROR_PATTERNS = [
-    // API / provider errors (from DB: 63 occurrences)
-    "bad request",
-    "reasoning_opaque",
-    "prefill",
-    "SSE read timed out",
-    "DecimalError",
-    // Context / compaction errors (from DB: 7 occurrences)
-    "ContextOverflowError",
-    "too large to compact",
-    // Tool execution errors (from GitHub issues)
-    "Invalid diff",
-    "Tool execution aborted",
-    "JSON parsing failed",
-    "Invalid input for tool",
-    "tried to call unavailable tool",
-    "finding less tool calls",
-    "tool_use ids were found without tool_result",
-    // Connection errors (mid-stream, not initial connect)
-    "ECONNREFUSED",
-    "ECONNRESET",
-    // Stream / timeout errors
-    "idle timeout",
-    "no data received",
-    // Type / validation errors
-    "expected string, received undefined",
-];
-const DEFAULT_EXCLUDE_PATTERNS = [
-    // User-initiated abort — never auto-continue
-    "MessageAbortedError",
-    "operation was aborted",
-];
-/**
- * Default configuration values.
- */
+import { Plugin } from "@opencode/plugin";
+const CONFIG_FILE = "opencode-auto-continue.jsonc";
+const MAX_FAILURES = 3;
 const DEFAULTS = {
-    /** Minimum ms between auto-continues for the same session */
-    throttleMs: 5_000,
-    /** Delay after session.idle before sending continue */
-    delayMs: 500,
-    /** Max consecutive auto-continues per session before giving up (0 = unlimited) */
-    maxConsecutive: 5,
-    /** Whether the plugin is enabled */
     enabled: true,
-    /** Minimum ms between remote version checks */
-    updateThrottleMs: 30_000,
-    /** Disable all remote calls and version-related filesystem checks */
-    offlineMode: false,
-    /** Error patterns to auto-continue on (case-insensitive substrings) */
-    errorPatterns: DEFAULT_ERROR_PATTERNS,
-    /** Error patterns to NEVER auto-continue on (checked first, case-insensitive substrings) */
-    excludePatterns: DEFAULT_EXCLUDE_PATTERNS,
+    delayMs: 1_000,
+    throttleMs: 5_000,
+    maxConsecutive: 0,
 };
-// ─── Helpers ────────────────────────────────────────────────────────────────
-function parseJsonc(text) {
-    let result = "";
+function stripJsonc(text) {
+    let out = "";
     let inString = false;
-    let stringChar = "";
-    let i = 0;
-    while (i < text.length) {
+    let quote = "";
+    for (let i = 0; i < text.length; i += 1) {
+        const char = text[i];
         if (inString) {
-            if (text[i] === "\\" && i + 1 < text.length) {
-                result += text[i] + text[i + 1];
-                i += 2;
-                continue;
+            out += char;
+            if (char === "\\") {
+                out += text[i + 1] ?? "";
+                i += 1;
             }
-            if (text[i] === stringChar) {
+            else if (char === quote) {
                 inString = false;
             }
-            result += text[i];
-            i++;
+            continue;
         }
-        else {
-            if (text[i] === '"' || text[i] === "'") {
-                inString = true;
-                stringChar = text[i];
-                result += text[i];
-                i++;
-            }
-            else if (text[i] === "/" && i + 1 < text.length && text[i + 1] === "/") {
-                while (i < text.length && text[i] !== "\n")
-                    i++;
-            }
-            else if (text[i] === "/" && i + 1 < text.length && text[i + 1] === "*") {
-                i += 2;
-                while (i < text.length && !(text[i] === "*" && i + 1 < text.length && text[i + 1] === "/"))
-                    i++;
-                i += 2;
-            }
-            else {
-                result += text[i];
-                i++;
-            }
+        if (char === '"' || char === "'") {
+            inString = true;
+            quote = char;
+            out += char;
+            continue;
         }
+        if (char === "/" && text[i + 1] === "/") {
+            while (i < text.length && text[i] !== "\n")
+                i += 1;
+            out += "\n";
+            continue;
+        }
+        if (char === "/" && text[i + 1] === "*") {
+            i += 2;
+            while (i < text.length && !(text[i] === "*" && text[i + 1] === "/"))
+                i += 1;
+            i += 1;
+            continue;
+        }
+        out += char;
     }
-    // Strip trailing commas before } or ]
-    result = result.replace(/,\s*([}\]])/g, "$1");
-    return JSON.parse(result);
+    return out.replace(/,\s*([}\]])/g, "$1");
 }
-async function loadConfig(directory, log) {
-    const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
+async function loadConfig(directory) {
     try {
-        const raw = await readFile(configPath, "utf-8");
-        const parsed = parseJsonc(raw);
-        const config = { ...DEFAULTS };
-        if (typeof parsed.throttleMs === "number")
-            config.throttleMs = parsed.throttleMs;
-        if (typeof parsed.delayMs === "number")
-            config.delayMs = parsed.delayMs;
-        if (typeof parsed.maxConsecutive === "number")
-            config.maxConsecutive = parsed.maxConsecutive;
-        if (typeof parsed.enabled === "boolean")
-            config.enabled = parsed.enabled;
-        if (typeof parsed.updateThrottleMs === "number")
-            config.updateThrottleMs = parsed.updateThrottleMs;
-        if (typeof parsed.offlineMode === "boolean")
-            config.offlineMode = parsed.offlineMode;
-        if (Array.isArray(parsed.errorPatterns)) {
-            config.errorPatterns = parsed.errorPatterns.filter((p) => typeof p === "string");
-        }
-        if (Array.isArray(parsed.excludePatterns)) {
-            config.excludePatterns = parsed.excludePatterns.filter((p) => typeof p === "string");
-        }
-        log(`Loaded config from ${configPath}: ${JSON.stringify(config)}`);
-        return config;
+        const raw = await readFile(join(directory, ".opencode", CONFIG_FILE), "utf-8");
+        const parsed = JSON.parse(stripJsonc(raw));
+        const amount = (value, fallback) => typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : fallback;
+        return {
+            enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULTS.enabled,
+            delayMs: amount(parsed.delayMs, DEFAULTS.delayMs),
+            throttleMs: amount(parsed.throttleMs, DEFAULTS.throttleMs),
+            maxConsecutive: Math.floor(amount(parsed.maxConsecutive, DEFAULTS.maxConsecutive)),
+        };
     }
-    catch (err) {
-        const code = err?.code;
-        if (code === "ENOENT") {
-            log(`No config file at ${configPath}, using defaults`);
-        }
-        else {
-            log(`Error reading config from ${configPath}: ${err} — using defaults`);
-        }
+    catch {
         return { ...DEFAULTS };
     }
 }
-function isRetryableError(error, config) {
-    if (!error || typeof error !== "object")
-        return false;
-    const err = error;
-    const data = err.data;
-    const name = typeof err.name === "string" ? err.name : "";
-    const message = (typeof data?.message === "string" ? data.message : null) ??
-        (typeof err.message === "string" ? err.message : "");
-    // Build a single matchable string: "ErrorName: error message text"
-    const matchStr = `${name}: ${message}`.toLowerCase();
-    // Exclude patterns checked first — if any match, never retry
-    for (const pattern of config.excludePatterns) {
-        if (matchStr.includes(pattern.toLowerCase()))
-            return false;
-    }
-    // Error patterns — if any match, retry
-    for (const pattern of config.errorPatterns) {
-        if (matchStr.includes(pattern.toLowerCase()))
-            return true;
-    }
-    return false;
-}
-function errorMessage(error) {
-    if (!error || typeof error !== "object")
-        return "unknown";
-    const err = error;
-    const data = err.data;
-    return ((typeof data?.message === "string" ? data.message : null) ??
-        (typeof err.message === "string" ? err.message : null) ??
-        String(err.name ?? "unknown"));
-}
-// ─── Plugin ─────────────────────────────────────────────────────────────────
-const plugin = async ({ client, directory }) => {
-    const sessions = new Map();
-    const sessionConfigs = new Map();
-    // Silent log — console.log leaks into the TUI as raw terminal output
-    function log(_msg) {
-        // intentionally silent
-    }
-    // Global config — loaded from file, mutated by /auto-continue global commands
-    const globalConfig = await loadConfig(directory, log);
-    // Snapshot content hash at load time
-    const loadedHash = await readInstalledHash();
-    log(`Loaded with content hash: ${loadedHash ?? "unknown"}`);
-    // Cached remote version check (debounced)
-    let lastRemoteCheck = 0;
-    let cachedRemoteHash = null;
-    let cachedCommitSha = null;
-    // Commit SHA for the loaded version — persisted to XDG cache file
-    let loadedCommitSha = null;
-    let loadedCommitConfirmed = false; // true = verified via direct hash match with remote
-    let loadedCommitUncertain = false; // true = from file with mismatched hash → show "?"
-    // On-load: try to recover loadedCommitSha from cache file, fall back to remote
-    if (!globalConfig.offlineMode && loadedHash) {
-        try {
-            const cached = await readLoadedCommitFile();
-            if (cached && cached.hash === loadedHash) {
-                loadedCommitSha = cached.commitSha;
-                // Hash-verified from file — reliable but not yet confirmed with remote
+export default Plugin.define({
+    id: "opencode-auto-continue",
+    async setup(ctx) {
+        const config = await loadConfig(ctx.location.directory);
+        const sessions = new Map();
+        const controller = new AbortController();
+        const stateFor = (sessionID) => {
+            let state = sessions.get(sessionID);
+            if (!state) {
+                state = {
+                    enabled: config.enabled,
+                    suspended: false,
+                    executing: false,
+                    ownPrompt: false,
+                    seenExecution: false,
+                    consecutive: 0,
+                    failures: 0,
+                    lastContinue: 0,
+                    skipScheduleUntil: 0,
+                };
+                sessions.set(sessionID, state);
             }
-            else if (cached) {
-                loadedCommitSha = cached.commitSha;
-                loadedCommitUncertain = true; // file hash ≠ loadedHash
-            }
-        }
-        catch { }
-        // If still no commit SHA, do a one-time remote fetch to try to capture it
-        if (!loadedCommitSha) {
-            try {
-                await fetchLatestHash();
-            }
-            catch { }
-        }
-    }
-    /** Check whether the cached module has been cleared (by global update in any session) */
-    async function isCacheCleared() {
-        const { cache } = getOpencodeDirs();
-        // Check if cache dir exists at all
-        try {
-            await access(cache);
-        }
-        catch {
-            return true; // entire cache gone → cleared
-        }
-        // Check packages dir for our plugin (may be in a nested URL-based path)
-        try {
-            const packagesDir = join(cache, "packages");
-            const entries = await readdir(packagesDir);
-            for (const entry of entries) {
-                if (!entry.startsWith(PLUGIN_NAME))
-                    continue;
-                // Check if this dir has actual content (node_modules with files)
-                try {
-                    const nmDir = join(packagesDir, entry, "node_modules");
-                    await access(nmDir);
-                    return false; // has node_modules → not cleared
-                }
-                catch { }
-            }
-        }
-        catch { }
-        return true; // plugin not found or empty → cleared
-    }
-    async function fetchLatestHash() {
-        if (globalConfig.offlineMode) {
-            return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
-        }
-        const cfg = globalConfig;
-        const now = Date.now();
-        if (now - lastRemoteCheck < cfg.updateThrottleMs) {
-            return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
-        }
-        try {
-            const response = await fetch(GITHUB_API_RELEASE, {
-                headers: { "User-Agent": PLUGIN_NAME },
-            });
-            if (!response.ok)
-                return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
-            const release = (await response.json());
-            const body = release.body || "";
-            const bodyLines = body.split("\n");
-            cachedRemoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
-            const commitLine = bodyLines.find((l) => l.startsWith("Commit: "));
-            cachedCommitSha = commitLine?.replace("Commit: ", "").trim() ?? null;
-            lastRemoteCheck = now;
-            // Loaded commit SHA tracking — persist to cache file
-            if (loadedHash && cachedRemoteHash === loadedHash && cachedCommitSha) {
-                // Direct match — confirmed
-                loadedCommitSha = cachedCommitSha;
-                loadedCommitConfirmed = true;
-                loadedCommitUncertain = false;
-                writeLoadedCommitFile(loadedHash, cachedCommitSha).catch(() => { });
-            }
-            else if (loadedHash && cachedRemoteHash !== loadedHash && !loadedCommitConfirmed) {
-                // Hashes don't match and not previously confirmed — re-read file each time
-                // (may have been cleared by global update in another session)
-                try {
-                    const cached = await readLoadedCommitFile();
-                    if (cached && cached.hash === loadedHash) {
-                        loadedCommitSha = cached.commitSha;
-                        loadedCommitUncertain = false;
-                    }
-                    else if (cached) {
-                        loadedCommitSha = cached.commitSha;
-                        loadedCommitUncertain = true; // file hash ≠ loadedHash
-                    }
-                    else {
-                        loadedCommitSha = null;
-                        loadedCommitUncertain = false;
-                    }
-                }
-                catch {
-                    // Don't clear existing value on read failure
-                }
-            }
-        }
-        catch {
-            // Network failure — keep stale cache
-        }
-        return { hash: cachedRemoteHash, commitSha: cachedCommitSha };
-    }
-    // Version info for display
-    function formatLoadedCommitSuffix(remoteCommitSha) {
-        if (!loadedCommitSha)
-            return " (commit: unknown)";
-        const short = loadedCommitSha.substring(0, 7);
-        // Same commit SHA but different content hashes → commit unreliable
-        if (remoteCommitSha && loadedCommitSha === remoteCommitSha
-            && loadedHash && cachedRemoteHash && loadedHash !== cachedRemoteHash) {
-            return " (commit: unknown)";
-        }
-        if (loadedCommitConfirmed)
-            return ` (commit: ${short})`;
-        if (loadedCommitUncertain)
-            return ` (commit: ${short}?)`;
-        return ` (commit: ${short})`;
-    }
-    async function versionInfo(checkRemote = false) {
-        const loadedShort = loadedHash ? shortHash(loadedHash) : "unknown";
-        const currentHash = await readInstalledHash();
-        const currentShort = currentHash ? shortHash(currentHash) : "unknown";
-        const lines = [];
-        // Local: loaded vs current bun.lock
-        const localUpdated = loadedHash && currentHash && loadedHash !== currentHash;
-        // Remote check (only when requested — status, help with /ac)
-        if (checkRemote) {
-            const { hash: remoteHash, commitSha } = await fetchLatestHash();
-            const remoteShort = remoteHash ? shortHash(remoteHash) : null;
-            const shortSha = commitSha?.substring(0, 7) ?? "";
-            const remoteCommitSuffix = shortSha ? ` (commit: ${shortSha})` : "";
-            const loadedCSuffix = formatLoadedCommitSuffix(commitSha);
-            if (remoteHash && remoteShort) {
-                const matchesLoaded = loadedHash === remoteHash;
-                const matchesCurrent = currentHash === remoteHash;
-                const cacheCleared = await isCacheCleared();
-                // Base version — include commit when up-to-date
-                if (matchesLoaded && matchesCurrent) {
-                    lines.push(`${loadedShort}${remoteCommitSuffix}`);
-                }
-                else {
-                    lines.push(`${loadedShort}${loadedCSuffix}`);
-                }
-                if (localUpdated) {
-                    lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
-                }
-                if (matchesLoaded && matchesCurrent) {
-                    // All same — already shown commit above
-                }
-                else if (!localUpdated && !matchesLoaded) {
-                    // loaded == current, remote is different → update available
-                    if (cacheCleared) {
-                        lines.push(`  🆕 Update ready: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
-                        lines.push(`     Restart opencode to load the new version`);
-                    }
-                    else {
-                        lines.push(`  🆕 Update available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
-                        lines.push(`     Run /ac global update then restart opencode`);
-                    }
-                }
-                else if (localUpdated && matchesCurrent) {
-                    // Already updated locally, matches remote — just needs reload (already shown above)
-                }
-                else if (localUpdated && !matchesCurrent && !matchesLoaded) {
-                    // All three differ: loaded ≠ current ≠ remote
-                    if (cacheCleared) {
-                        lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
-                        lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
-                        lines.push(`     Restart opencode to load the new version`);
-                    }
-                    else {
-                        lines.push(`  🆕 Newer version available: ${loadedShort}${loadedCSuffix} → ${remoteShort}${remoteCommitSuffix}`);
-                        lines.push(`     Pending reload has ${currentShort}, latest is ${remoteShort}`);
-                        lines.push(`     Run /ac global update then restart opencode`);
-                    }
-                }
-            }
-            else {
-                // Remote fetch failed or no remote hash — show base version with loaded commit if available
-                const fallbackSuffix = formatLoadedCommitSuffix(null);
-                lines.push(`${loadedShort}${fallbackSuffix !== " (commit: unknown)" ? fallbackSuffix : ""}`);
-                if (localUpdated) {
-                    lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
-                }
-            }
-        }
-        else {
-            // No remote check — just show base version
-            lines.push(loadedShort);
-            if (localUpdated) {
-                lines.push(`  ⚠️  *needs opencode reload* (bun: ${currentShort})`);
-            }
-        }
-        return lines.join("\n");
-    }
-    // Merge global config with per-session overrides
-    function getEffectiveConfig(sessionID) {
-        if (!sessionID)
-            return globalConfig;
-        const overrides = sessionConfigs.get(sessionID);
-        if (!overrides)
-            return globalConfig;
-        return { ...globalConfig, ...overrides };
-    }
-    // Send a message that appears in chat but does NOT trigger the LLM
-    async function sendMessage(sessionID, text) {
-        await client.session.prompt({
-            path: { id: sessionID },
-            body: {
-                noReply: true,
-                parts: [{ type: "text", text, ignored: true }],
-            },
-        });
-    }
-    // Write current globalConfig to disk
-    async function writeGlobalConfig() {
-        const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
-        // Omit pattern arrays from disk if they're still the defaults
-        const toWrite = {
-            throttleMs: globalConfig.throttleMs,
-            delayMs: globalConfig.delayMs,
-            maxConsecutive: globalConfig.maxConsecutive,
-            enabled: globalConfig.enabled,
-            updateThrottleMs: globalConfig.updateThrottleMs,
+            return state;
         };
-        if (globalConfig.offlineMode) {
-            toWrite.offlineMode = true;
-        }
-        if (globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS) {
-            toWrite.errorPatterns = globalConfig.errorPatterns;
-        }
-        if (globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS) {
-            toWrite.excludePatterns = globalConfig.excludePatterns;
-        }
-        const content = JSON.stringify(toWrite, null, 2) + "\n";
-        await writeFile(configPath, content, "utf-8");
-        log(`Wrote global config to ${configPath}`);
-    }
-    function getState(sessionID) {
-        let state = sessions.get(sessionID);
-        if (!state) {
-            state = {
-                lastErrorTime: 0,
-                lastContinueTime: 0,
-                pendingContinue: false,
-                consecutiveCount: 0,
-            };
-            sessions.set(sessionID, state);
-        }
-        return state;
-    }
-    async function sendContinue(sessionID) {
-        const state = sessions.get(sessionID);
-        if (!state?.pendingContinue)
-            return;
-        const config = getEffectiveConfig(sessionID);
-        const now = Date.now();
-        if (now - state.lastContinueTime < config.throttleMs) {
-            const remaining = config.throttleMs - (now - state.lastContinueTime);
-            log(`Throttle active for session ${sessionID}, ${remaining}ms remaining, skipping`);
-            return;
-        }
-        if (config.maxConsecutive > 0 && state.consecutiveCount >= config.maxConsecutive) {
-            log(`Max consecutive (${config.maxConsecutive}) reached for ${sessionID}, giving up`);
-            state.pendingContinue = false;
-            return;
-        }
-        state.lastContinueTime = now;
-        state.consecutiveCount++;
-        state.pendingContinue = false;
-        const maxLabel = config.maxConsecutive > 0 ? `${config.maxConsecutive}` : "∞";
-        log(`Sending "continue" to ${sessionID} (attempt ${state.consecutiveCount}/${maxLabel})`);
-        try {
-            await client.session.promptAsync({
-                path: { id: sessionID },
-                body: {
-                    parts: [{ type: "text", text: "continue" }],
-                },
-            });
-            log(`Successfully sent "continue" to ${sessionID}`);
-        }
-        catch (err) {
-            log(`Failed to send "continue" to ${sessionID}: ${err}`);
-        }
-    }
-    // ── Command UI helpers ──────────────────────────────────────────────────
-    function overrideLines(overrides) {
-        const parts = [];
-        if (overrides.enabled !== undefined)
-            parts.push(`enabled: ${overrides.enabled}`);
-        if (overrides.throttleMs !== undefined)
-            parts.push(`throttle: ${overrides.throttleMs}ms`);
-        if (overrides.delayMs !== undefined)
-            parts.push(`delay: ${overrides.delayMs}ms`);
-        if (overrides.maxConsecutive !== undefined)
-            parts.push(`max: ${overrides.maxConsecutive === 0 ? "unlimited" : overrides.maxConsecutive}`);
-        if (overrides.updateThrottleMs !== undefined)
-            parts.push(`update-throttle: ${overrides.updateThrottleMs}ms`);
-        const globalParts = [
-            `enabled: ${globalConfig.enabled}`,
-            `throttle: ${globalConfig.throttleMs}ms`,
-            `delay: ${globalConfig.delayMs}ms`,
-            `max: ${globalConfig.maxConsecutive === 0 ? "unlimited" : globalConfig.maxConsecutive}`,
-        ];
-        if (globalConfig.updateThrottleMs !== DEFAULTS.updateThrottleMs) {
-            globalParts.push(`update-throttle: ${globalConfig.updateThrottleMs}ms`);
-        }
-        return ["", `  Session overrides: ${parts.join(" · ")}`, `  Global defaults:   ${globalParts.join(" · ")}`];
-    }
-    async function configSummaryLines(sessionID, checkRemote = false) {
-        const cfg = getEffectiveConfig(sessionID);
-        const overrides = sessionConfigs.get(sessionID);
-        const status = cfg.enabled ? "✅ enabled" : "❌ disabled";
-        const ver = await versionInfo(checkRemote);
-        const maxDisplay = cfg.maxConsecutive === 0 ? "unlimited" : String(cfg.maxConsecutive);
-        const summaryParts = [`Throttle: ${cfg.throttleMs}ms`, `Delay: ${cfg.delayMs}ms`, `Max: ${maxDisplay}`];
-        if (cfg.updateThrottleMs !== DEFAULTS.updateThrottleMs) {
-            summaryParts.push(`Update: ${cfg.updateThrottleMs}ms`);
-        }
-        const lines = [`  Status: ${status} · ${ver}`, `  ${summaryParts.join(" · ")}`];
-        if (overrides && Object.keys(overrides).length > 0) {
-            lines.push(...overrideLines(overrides));
-        }
-        return lines;
-    }
-    async function helpText(sessionID) {
-        const lines = [
-            "╭──────────────────────────────────────────╮",
-            "│       Auto-Continue Commands             │",
-            "╰──────────────────────────────────────────╯",
-            "",
-            ...(await configSummaryLines(sessionID, true)),
-        ];
-        lines.push("", "  /auto-continue on|off              Enable/disable (session)", "  /auto-continue throttle <ms>         Set retry throttle (session)", "  /auto-continue delay <ms>          Set delay (session)", "  /auto-continue max <n>             Set max retries (session, 0=unlimited)", "  /auto-continue update-throttle <ms>  Set update throttle (session)", "  /auto-continue status              Show current settings", "  /auto-continue patterns            Show active error patterns", "  /auto-continue reload              Reload global config from disk", "  /auto-continue reset               Clear session overrides", "  /auto-continue global <cmd>        Persist setting to config file", "  /auto-continue global update       Clear opencode cache to fetch latest version", "  /auto-continue global update force Clear opencode + system bun/npm caches", "  /auto-continue global offline on|off  Disable all remote/version checks", "  /auto-continue help                Show this help", "", "  Alias: /ac (same commands, e.g. /ac status)");
-        return lines.join("\n");
-    }
-    async function statusText(sessionID) {
-        const cfg = getEffectiveConfig(sessionID);
-        const overrides = sessionConfigs.get(sessionID);
-        const state = sessions.get(sessionID);
-        const ver = await versionInfo(true);
-        const lines = [
-            "╭──────────────────────────────────────────╮",
-            "│       Auto-Continue Status               │",
-            "╰──────────────────────────────────────────╯",
-            "",
-            `  Version:         ${ver}`,
-            `  Enabled:         ${cfg.enabled ? "✅ yes" : "❌ no"}`,
-            `  Offline mode:    ${globalConfig.offlineMode ? "✅ on" : "❌ off"}`,
-            `  Throttle:        ${cfg.throttleMs}ms`,
-            `  Delay:           ${cfg.delayMs}ms`,
-            `  Max Retries:     ${cfg.maxConsecutive === 0 ? "unlimited (0)" : cfg.maxConsecutive}`,
-            `  Update throttle: ${cfg.updateThrottleMs}ms`,
-        ];
-        if (overrides && Object.keys(overrides).length > 0) {
-            lines.push("");
-            lines.push("  ── Session Overrides ──");
-            if (overrides.enabled !== undefined)
-                lines.push(`  Enabled:         ${overrides.enabled ? "✅ yes" : "❌ no"}  (global: ${globalConfig.enabled ? "yes" : "no"})`);
-            if (overrides.throttleMs !== undefined)
-                lines.push(`  Throttle:        ${overrides.throttleMs}ms  (global: ${globalConfig.throttleMs}ms)`);
-            if (overrides.delayMs !== undefined)
-                lines.push(`  Delay:           ${overrides.delayMs}ms  (global: ${globalConfig.delayMs}ms)`);
-            if (overrides.maxConsecutive !== undefined)
-                lines.push(`  Max Retries:     ${overrides.maxConsecutive === 0 ? "unlimited (0)" : overrides.maxConsecutive}  (global: ${globalConfig.maxConsecutive === 0 ? "unlimited (0)" : globalConfig.maxConsecutive})`);
-            if (overrides.updateThrottleMs !== undefined)
-                lines.push(`  Update throttle: ${overrides.updateThrottleMs}ms  (global: ${globalConfig.updateThrottleMs}ms)`);
-        }
-        const checkRemaining = lastRemoteCheck > 0
-            ? Math.max(0, cfg.updateThrottleMs - (Date.now() - lastRemoteCheck))
-            : null;
-        const retryRemaining = state?.lastContinueTime && state.lastContinueTime > 0
-            ? Math.max(0, cfg.throttleMs - (Date.now() - state.lastContinueTime))
-            : null;
-        lines.push("", "  ── Session State ──");
-        if (retryRemaining !== null) {
-            lines.push(`  Retry cooldown:      ${retryRemaining > 0 ? `${retryRemaining}ms` : "ready"}`);
-        }
-        lines.push(`  Consecutive retries: ${state?.consecutiveCount ?? 0}`, `  Pending continue:    ${state?.pendingContinue ? "yes" : "no"}`);
-        if (checkRemaining !== null) {
-            lines.push(`  Update cooldown:     ${checkRemaining > 0 ? `${checkRemaining}ms` : "ready"}`);
-        }
-        lines.push("", "  ── Global Config ──", `  ${JSON.stringify({ ...globalConfig, errorPatterns: `[${globalConfig.errorPatterns.length} patterns]`, excludePatterns: `[${globalConfig.excludePatterns.length} patterns]` })}`);
-        const isCustomPatterns = globalConfig.errorPatterns !== DEFAULT_ERROR_PATTERNS;
-        const isCustomExcludes = globalConfig.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
-        lines.push("", `  ── Error Patterns (${cfg.errorPatterns.length} match, ${cfg.excludePatterns.length} exclude) ──`, `  Patterns: ${isCustomPatterns ? "custom" : "default"}  ·  Excludes: ${isCustomExcludes ? "custom" : "default"}`, "  Run /ac patterns for full list");
-        return lines.join("\n");
-    }
-    // ── Hooks ───────────────────────────────────────────────────────────────
-    // Extracted command handler shared by /auto-continue and /ac
-    async function handleCommand(input) {
-        const args = (input.arguments || "").trim().split(/\s+/).filter(Boolean);
-        const subcmd = args[0]?.toLowerCase() || "";
-        const sessionID = input.sessionID;
-        // ── Help (default) ──
-        if (!subcmd || subcmd === "help") {
-            await sendMessage(sessionID, await helpText(sessionID));
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        // ── On / Off ──
-        if (subcmd === "on" || subcmd === "off") {
-            const enabled = subcmd === "on";
-            const overrides = sessionConfigs.get(sessionID) || {};
-            overrides.enabled = enabled;
-            sessionConfigs.set(sessionID, overrides);
-            await sendMessage(sessionID, `Auto-continue ${enabled ? "✅ enabled" : "❌ disabled"} for this session.`);
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        // ── Throttle / Delay / Max / Check-Interval ──
-        if (subcmd === "throttle" || subcmd === "delay" || subcmd === "max" || subcmd === "update-throttle") {
-            const value = parseInt(args[1], 10);
-            if (isNaN(value) || value < 0) {
-                await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue ${subcmd} <number>`);
-                throw new Error("__AUTO_CONTINUE_HANDLED__");
+        const cancel = (state) => {
+            if (state.timer) {
+                clearTimeout(state.timer);
+                state.timer = undefined;
             }
-            const overrides = sessionConfigs.get(sessionID) || {};
-            const keyMap = {
-                throttle: "throttleMs",
-                delay: "delayMs",
-                max: "maxConsecutive",
-                "update-throttle": "updateThrottleMs",
-            };
-            overrides[keyMap[subcmd]] = value;
-            sessionConfigs.set(sessionID, overrides);
-            const label = subcmd === "throttle"
-                ? "Throttle"
-                : subcmd === "delay"
-                    ? "Delay"
-                    : subcmd === "max"
-                        ? "Max consecutive"
-                        : "Update throttle";
-            const unit = subcmd === "max" ? "" : "ms";
-            await sendMessage(sessionID, `${label} set to ${value}${unit} for this session.`);
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        // ── Status ──
-        if (subcmd === "status") {
-            await sendMessage(sessionID, await statusText(sessionID));
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        // ── Patterns (show all active error patterns) ──
-        if (subcmd === "patterns") {
-            const cfg = getEffectiveConfig(sessionID);
-            const isCustom = cfg.errorPatterns !== DEFAULT_ERROR_PATTERNS;
-            const isCustomExcl = cfg.excludePatterns !== DEFAULT_EXCLUDE_PATTERNS;
-            const lines = [
-                "╭──────────────────────────────────────────╮",
-                "│       Error Patterns                     │",
-                "╰──────────────────────────────────────────╯",
-                "",
-                `  ── Match Patterns (${cfg.errorPatterns.length}) ${isCustom ? "[custom]" : "[default]"} ──`,
-                ...cfg.errorPatterns.map(p => `    • ${p}`),
-                "",
-                `  ── Exclude Patterns (${cfg.excludePatterns.length}) ${isCustomExcl ? "[custom]" : "[default]"} ──`,
-                ...cfg.excludePatterns.map(p => `    ✕ ${p}`),
-                "",
-                "  Matching: case-insensitive substring against \"ErrorName: message\"",
-                "  Excludes are checked first. Override via config file.",
-            ];
-            await sendMessage(sessionID, lines.join("\n"));
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        // ── Reload (re-read global config from disk) ──
-        if (subcmd === "reload") {
-            const configPath = join(directory, CONFIG_DIR, CONFIG_FILE);
-            let fileExists = false;
-            let rawContents = "";
+        };
+        const resume = async (sessionID) => {
+            const state = stateFor(sessionID);
+            state.timer = undefined;
+            if (!state.enabled || state.suspended || state.executing || !state.seenExecution)
+                return;
+            if (Date.now() < state.skipScheduleUntil)
+                return;
+            if (config.maxConsecutive > 0 && state.consecutive >= config.maxConsecutive)
+                return;
+            if (Date.now() - state.lastContinue < config.throttleMs)
+                return;
+            // A pending permission means the session is waiting for the user, not stopped.
+            const pending = await ctx.permission.list({ sessionID }).catch(() => []);
+            if (pending.length > 0)
+                return;
+            // Child sessions are driven by their parent, so they are left alone.
+            const session = await ctx.session.get({ sessionID }).catch(() => undefined);
+            if (!session || session.parentID)
+                return;
+            state.consecutive += 1;
+            state.lastContinue = Date.now();
+            state.ownPrompt = true;
+            state.executing = true;
             try {
-                rawContents = await readFile(configPath, "utf-8");
-                fileExists = true;
+                await ctx.session.prompt({ sessionID, text: "continue" });
             }
             catch {
-                // File doesn't exist
+                state.ownPrompt = false;
+                state.executing = false;
             }
-            const reloaded = await loadConfig(directory, log);
-            Object.assign(globalConfig, reloaded);
-            const lines = [];
-            if (fileExists) {
-                lines.push("Auto-continue global config reloaded", `  From: ${configPath}`, `  Contents: ${rawContents.trim()}`);
-            }
-            else {
-                lines.push("Auto-continue global config reloaded", `  No ${CONFIG_FILE} found at ${configPath} — using defaults`);
-            }
-            lines.push("", ...(await configSummaryLines(sessionID)));
-            await sendMessage(sessionID, lines.join("\n"));
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        // ── Reset (clear session overrides) ──
-        if (subcmd === "reset") {
-            sessionConfigs.delete(sessionID);
-            await sendMessage(sessionID, "Session overrides cleared. Using global config.");
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        // ── Global ──
-        if (subcmd === "global") {
-            const globalSub = args[1]?.toLowerCase() || "";
-            // ── Global Update: wipe all regenerable files, check for new version ──
-            if (globalSub === "update") {
-                const forceMode = args[2]?.toLowerCase() === "force";
-                try {
-                    await sendMessage(sessionID, forceMode
-                        ? "Checking for updates and cleaning all regenerable files + system caches..."
-                        : "Checking for updates and cleaning opencode regenerable files...");
-                    // 1. Fetch latest release metadata (skipped in offline mode)
-                    let remoteHash = null;
-                    let shortSha = "unknown";
-                    let remoteShort = "unknown";
-                    if (!globalConfig.offlineMode) {
-                        try {
-                            const response = await fetch(GITHUB_API_RELEASE, {
-                                headers: { "User-Agent": PLUGIN_NAME },
-                            });
-                            if (response.ok) {
-                                const release = (await response.json());
-                                const body = release.body || "";
-                                const bodyLines = body.split("\n");
-                                remoteHash = bodyLines[0]?.startsWith("sha512-") ? bodyLines[0].trim() : null;
-                                const commitLine = bodyLines.find((l) => l.startsWith("Commit: "));
-                                const commitSha = commitLine?.replace("Commit: ", "").trim();
-                                shortSha = commitSha?.substring(0, 7) ?? "unknown";
-                                remoteShort = remoteHash ? shortHash(remoteHash) : "unknown";
-                                cachedRemoteHash = remoteHash;
-                                cachedCommitSha = commitSha ?? null;
-                                lastRemoteCheck = Date.now();
-                                if (loadedHash && remoteHash === loadedHash && commitSha) {
-                                    loadedCommitSha = commitSha;
-                                    loadedCommitConfirmed = true;
-                                    loadedCommitUncertain = false;
-                                    // Don't write file here — cache dir is about to be wiped
-                                }
-                            }
-                        }
-                        catch {
-                            // Network failure — continue with cleanup anyway
-                        }
-                    }
-                    const currentShort = loadedHash ? shortHash(loadedHash) : "unknown";
-                    const isUpToDate = loadedHash && remoteHash && loadedHash === remoteHash;
-                    // 2. Comprehensive cleanup of all regenerable files (always runs)
-                    const dirs = getOpencodeDirs();
-                    const cleaned = [];
-                    async function tryRm(target, opts) {
-                        try {
-                            await access(target);
-                            const resolved = await realpath(target).catch(() => target);
-                            const stats = await lstat(target).catch(() => null);
-                            const isDir = stats?.isDirectory() ?? !!opts?.recursive;
-                            await rm(target, { force: true, recursive: opts?.recursive });
-                            cleaned.push({ label: opts?.label || target, realPath: resolved, isDir });
-                        }
-                        catch {
-                            // doesn't exist or can't remove — not critical
-                        }
-                    }
-                    // a. Entire opencode cache dir (packages/, models.json, bin/, version)
-                    //    This is the same wipe opencode's own CACHE_VERSION guard does on version bumps.
-                    await tryRm(dirs.cache, { recursive: true, label: "cache dir (packages, models, version)" });
-                    // b. Config dir: regenerable package artifacts (NOT config files like opencode.jsonc)
-                    for (const name of ["bun.lock", "package.json", "package-lock.json"]) {
-                        await tryRm(join(dirs.config, name), { label: `config/${name}` });
-                    }
-                    await tryRm(join(dirs.config, "node_modules"), { recursive: true, label: "config/node_modules" });
-                    // c. Data dir: bin/ (LSP servers — re-downloaded on demand)
-                    await tryRm(join(dirs.data, "bin"), { recursive: true, label: "data/bin (LSP servers)" });
-                    // d. Stray package artifacts in data dir subdirectories
-                    try {
-                        const dataEntries = await readdir(dirs.data, { withFileTypes: true });
-                        for (const entry of dataEntries) {
-                            if (!entry.isDirectory() || entry.name === "bin")
-                                continue;
-                            const sub = join(dirs.data, entry.name);
-                            for (const name of ["bun.lock", "package.json", "package-lock.json"]) {
-                                await tryRm(join(sub, name), { label: `data/${entry.name}/${name}` });
-                            }
-                            await tryRm(join(sub, "node_modules"), { recursive: true, label: `data/${entry.name}/node_modules` });
-                        }
-                    }
-                    catch { }
-                    // e. Bun caches — system-wide, only with force (affects all bun projects)
-                    if (forceMode) {
-                        for (const dir of getBunCacheDirs()) {
-                            await tryRm(dir, { recursive: true, label: "bun cache" });
-                        }
-                    }
-                    // f. npm/arborist cache — system-wide, only with force (affects all npm projects)
-                    if (forceMode) {
-                        await tryRm(getNpmCacheDir(), { recursive: true, label: "npm cache" });
-                    }
-                    // 3. Report results
-                    const loadedCSuffix = formatLoadedCommitSuffix(cachedCommitSha);
-                    const remoteSuffix = shortSha !== "unknown" ? ` (commit: ${shortSha})` : "";
-                    const versionLine = isUpToDate
-                        ? `✅ Already up to date: ${currentShort}${remoteSuffix}`
-                        : remoteHash
-                            ? `🆕 Update available: ${currentShort}${loadedCSuffix} → ${remoteShort}${remoteSuffix}`
-                            : `⚠️  Could not check remote version (loaded: ${currentShort})`;
-                    const msg = [
-                        versionLine,
-                        "",
-                        cleaned.length > 0
-                            ? `Cleaned ${cleaned.length} items:`
-                            : "Nothing to clean (already clean).",
-                        ...cleaned.flatMap(c => [
-                            `  • ${c.label}`,
-                            `    ↳ ${c.realPath}${c.isDir ? "/" : ""}`,
-                        ]),
-                    ];
-                    if (!forceMode) {
-                        msg.push("", "  ℹ️  Run /ac global update force to also clear system-wide bun & npm caches");
-                    }
-                    msg.push("", "Restart opencode to reinstall plugins fresh.");
-                    await sendMessage(sessionID, msg.join("\n"));
-                }
-                catch (err) {
-                    if (err instanceof Error && err.message === "__AUTO_CONTINUE_HANDLED__")
-                        throw err;
-                    await sendMessage(sessionID, `❌ Update failed: ${err}`);
-                }
-                throw new Error("__AUTO_CONTINUE_HANDLED__");
-            }
-            if (globalSub === "on" || globalSub === "off") {
-                globalConfig.enabled = globalSub === "on";
-                await writeGlobalConfig();
-                await sendMessage(sessionID, `Global config: auto-continue ${globalSub === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`);
-                throw new Error("__AUTO_CONTINUE_HANDLED__");
-            }
-            if (globalSub === "offline") {
-                const val = args[2]?.toLowerCase();
-                if (val !== "on" && val !== "off") {
-                    await sendMessage(sessionID, "❌ Usage: /auto-continue global offline on|off");
-                    throw new Error("__AUTO_CONTINUE_HANDLED__");
-                }
-                globalConfig.offlineMode = val === "on";
-                await writeGlobalConfig();
-                await sendMessage(sessionID, `Global config: offline mode ${val === "on" ? "✅ enabled" : "❌ disabled"}. Written to ${CONFIG_FILE}.`);
-                throw new Error("__AUTO_CONTINUE_HANDLED__");
-            }
-            if (globalSub === "throttle" || globalSub === "delay" || globalSub === "max" || globalSub === "update-throttle") {
-                const value = parseInt(args[2], 10);
-                if (isNaN(value) || value < 0) {
-                    await sendMessage(sessionID, `❌ Invalid value. Usage: /auto-continue global ${globalSub} <number>`);
-                    throw new Error("__AUTO_CONTINUE_HANDLED__");
-                }
-                const keyMap = {
-                    throttle: "throttleMs",
-                    delay: "delayMs",
-                    max: "maxConsecutive",
-                    "update-throttle": "updateThrottleMs",
-                };
-                globalConfig[keyMap[globalSub]] = value;
-                await writeGlobalConfig();
-                const label = globalSub === "throttle"
-                    ? "Throttle"
-                    : globalSub === "delay"
-                        ? "Delay"
-                        : globalSub === "max"
-                            ? "Max consecutive"
-                            : "Update throttle";
-                const unit = globalSub === "max" ? "" : "ms";
-                await sendMessage(sessionID, `Global config: ${label} set to ${value}${unit}. Written to ${CONFIG_FILE}.`);
-                throw new Error("__AUTO_CONTINUE_HANDLED__");
-            }
-            // Global help (no recognized subcommand)
-            const text = [
-                "Usage: /auto-continue global <subcommand>",
-                "",
-                "  on|off              Enable/disable globally",
-                "  throttle <ms>       Set global retry throttle",
-                "  delay <ms>          Set global delay",
-                "  max <n>             Set global max retries (0=unlimited)",
-                "  update-throttle <ms> Set global update throttle",
-                "  update              Clear opencode cache to fetch latest version",
-                "  update force        Also clear system-wide bun & npm caches",
-                "  offline on|off      Disable all remote/version checks",
-            ].join("\n");
-            await sendMessage(sessionID, text);
-            throw new Error("__AUTO_CONTINUE_HANDLED__");
-        }
-        // ── Unknown ──
-        await sendMessage(sessionID, `❌ Unknown: /auto-continue ${args.join(" ")}\nType /auto-continue help for available commands.`);
-        throw new Error("__AUTO_CONTINUE_HANDLED__");
-    }
-    return {
-        // Register /auto-continue and /ac commands
-        config: async (opencodeConfig) => {
-            opencodeConfig.command ??= {};
-            opencodeConfig.command["auto-continue"] = {
-                template: "",
-                description: "Manage auto-continue settings (on/off, throttle, delay, max, reload)",
-            };
-            opencodeConfig.command["ac"] = {
-                template: "",
-                description: "Manage auto-continue settings (on/off, throttle, delay, max, reload)",
-            };
-        },
-        // Route both commands to the same handler
-        "command.execute.before": async (input, _output) => {
-            if (input.command !== "auto-continue" && input.command !== "ac")
+        };
+        const schedule = (sessionID) => {
+            const state = stateFor(sessionID);
+            if (!state.enabled ||
+                state.suspended ||
+                state.executing ||
+                state.timer ||
+                !state.seenExecution ||
+                Date.now() < state.skipScheduleUntil) {
                 return;
-            await handleCommand(input);
-        },
-        // React to events for auto-continue behavior
-        event: async ({ event }) => {
-            // ── session.error: detect retryable errors ──
-            if (event.type === "session.error") {
-                const props = event.properties;
-                const { sessionID, error } = props;
-                if (!sessionID)
-                    return;
-                const config = getEffectiveConfig(sessionID);
-                if (!config.enabled)
-                    return;
-                if (isRetryableError(error, config)) {
-                    log(`Retryable error in ${sessionID}: ${errorMessage(error)}`);
-                    const state = getState(sessionID);
-                    state.lastErrorTime = Date.now();
-                    state.pendingContinue = true;
-                }
             }
-            // ── message.updated: detect errors + reset on success ──
-            if (event.type === "message.updated") {
-                const props = event.properties;
-                const info = props.info;
-                if (!info?.sessionID || info.role !== "assistant")
-                    return;
-                const config = getEffectiveConfig(info.sessionID);
-                // Retryable error on assistant message
-                if (config.enabled && isRetryableError(info.error, config)) {
-                    log(`Retryable error on assistant message in ${info.sessionID}: ${errorMessage(info.error)}`);
-                    const state = getState(info.sessionID);
-                    state.lastErrorTime = Date.now();
-                    state.pendingContinue = true;
-                }
-                // Reset counter on successful completion
-                if (info.metadata?.done && !info.error) {
-                    const state = sessions.get(info.sessionID);
-                    if (state && state.consecutiveCount > 0) {
-                        log(`${info.sessionID} completed successfully, resetting counter`);
-                        state.consecutiveCount = 0;
+            state.timer = setTimeout(() => void resume(sessionID), config.delayMs);
+        };
+        const subscribe = async () => {
+            try {
+                for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+                    if (event.type === "session.idle") {
+                        const state = stateFor(event.data.sessionID);
+                        state.executing = false;
+                        schedule(event.data.sessionID);
+                        continue;
+                    }
+                    if (event.type === "session.execution.started") {
+                        const state = stateFor(event.data.sessionID);
+                        cancel(state);
+                        state.seenExecution = true;
+                        state.executing = true;
+                        if (!state.ownPrompt && Date.now() >= state.skipScheduleUntil) {
+                            state.suspended = false;
+                            state.consecutive = 0;
+                            state.failures = 0;
+                        }
+                        state.ownPrompt = false;
+                        continue;
+                    }
+                    if (event.type === "session.execution.succeeded" || event.type === "session.execution.failed") {
+                        const state = stateFor(event.data.sessionID);
+                        const afterCommand = Date.now() < state.skipScheduleUntil;
+                        state.skipScheduleUntil = 0;
+                        state.executing = false;
+                        state.ownPrompt = false;
+                        state.failures =
+                            event.type === "session.execution.failed" ? state.failures + 1 : 0;
+                        if (!afterCommand && state.failures < MAX_FAILURES) {
+                            schedule(event.data.sessionID);
+                        }
+                        continue;
+                    }
+                    if (event.type === "session.execution.interrupted") {
+                        const state = stateFor(event.data.sessionID);
+                        cancel(state);
+                        state.executing = false;
+                        state.ownPrompt = false;
+                        if (event.data.reason === "user")
+                            state.suspended = true;
                     }
                 }
             }
-            // ── session.idle: send continue if pending ──
-            if (event.type === "session.idle") {
-                const props = event.properties;
-                const sessionID = props.sessionID;
-                if (!sessionID)
-                    return;
-                const config = getEffectiveConfig(sessionID);
-                if (!config.enabled)
-                    return;
-                const state = sessions.get(sessionID);
-                if (state?.pendingContinue) {
-                    log(`${sessionID} idle with pending continue, waiting ${config.delayMs}ms...`);
-                    setTimeout(() => sendContinue(sessionID), config.delayMs);
-                }
+            catch {
+                // The stream closes when the plugin unloads.
             }
-        },
-    };
-};
-export default plugin;
+        };
+        void subscribe();
+        const runCommand = async ({ sessionID, prompt }) => {
+            const state = stateFor(sessionID);
+            // The command output itself is a synthetic turn; it must not trigger a continue.
+            state.skipScheduleUntil = Date.now() + 60_000;
+            const raw = prompt.text
+                .trim()
+                .replace(/^\/(?:auto-continue|ac)\b/i, "")
+                .trim();
+            const subcommand = (raw.split(/\s+/)[0] ?? "").toLowerCase();
+            if (subcommand === "on" || subcommand === "off") {
+                state.enabled = subcommand === "on";
+                state.consecutive = 0;
+                state.suspended = false;
+                if (!state.enabled)
+                    cancel(state);
+                await ctx.session.synthetic({
+                    sessionID,
+                    text: `Auto-continue ${state.enabled ? "enabled" : "disabled"} for this session.`,
+                });
+                return;
+            }
+            if (subcommand === "reset") {
+                state.consecutive = 0;
+                state.suspended = false;
+                await ctx.session.synthetic({ sessionID, text: "Auto-continue counters cleared." });
+                return;
+            }
+            await ctx.session.synthetic({
+                sessionID,
+                text: [
+                    `Auto-continue: ${state.enabled ? "on" : "off"}`,
+                    `Delay: ${config.delayMs}ms`,
+                    `Throttle: ${config.throttleMs}ms`,
+                    `Max consecutive: ${config.maxConsecutive === 0 ? "unlimited" : config.maxConsecutive}`,
+                    `Continues sent: ${state.consecutive}`,
+                    "",
+                    "/ac on | off | reset | status",
+                ].join("\n"),
+            });
+        };
+        await ctx.command.transform((editor) => {
+            const description = "Control automatic continuation (on, off, reset, status)";
+            editor.add({ name: "ac", description, execute: runCommand });
+            editor.add({ name: "auto-continue", description, execute: runCommand });
+        });
+        return () => {
+            for (const state of sessions.values())
+                cancel(state);
+            controller.abort();
+        };
+    },
+});
 //# sourceMappingURL=index.js.map
