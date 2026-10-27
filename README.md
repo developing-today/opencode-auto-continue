@@ -1,5 +1,23 @@
 # opencode-auto-continue
 
+> **ARCHIVED 2026-10-27** — this plugin is no longer maintained and does not run on
+> OpenCode v2. Decision and full compatibility assessment:
+> https://github.com/developing-today/opencode/issues/617
+>
+> Why: the plugin is built on the v1 plugin API (a default-exported factory returning
+> `config` / `command.execute.before` / `event` hooks). OpenCode v2's plugin loader
+> requires a default export of `{ id, setup }` (or `{ id, effect }`) and rejects the v1
+> shape at load time. The plugin's core use case is also built into v2 itself now: the
+> session runner retries retryable provider/transport/rate-limit failures in-step
+> (exponential backoff, up to 10 attempts, retry-after honored), auto-compacts on
+> context overflow, and synthesizes a continue for incomplete streams.
+>
+> Last-known-good build for OpenCode v1: the `latest` release / tag
+> (`20260406T122820Z-aceb217`), installable via the tarball URL below. The final state
+> of this repository is also tagged `v1-final`. To revive the idea on v2, start from
+> the v1→v2 mapping table in the decision comment on the issue above.
+
+
 OpenCode plugin that automatically sends "continue" when transient errors occur, allowing sessions to recover and resume without manual intervention. Handles API errors, provider issues, context overflow, connection resets, tool failures, and more — with configurable error patterns so you control exactly which errors trigger a retry.
 
 <img width="322" height="162" alt="image" src="https://github.com/user-attachments/assets/51726631-5c5c-474a-8fa1-dd69631140c5" />
